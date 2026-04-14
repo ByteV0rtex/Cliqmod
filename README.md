@@ -5,6 +5,8 @@ A fully modular, ultra customizable macro pad system built around a CNC-machined
 Reconfigures itself for whatever you’re doing. No cables, no adapters, no reflashing.
 
 -----
+> [!NOTE]
+> This project is still in the protoyping stage, details may change in the future.
 
 ## Modules
 
