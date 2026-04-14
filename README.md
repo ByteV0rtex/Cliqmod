@@ -1,8 +1,20 @@
 # Cliqmod ⌨️
 
-A fully modular macro pad built around a CNC-machined aluminum core and a family of hot-swap I²C modules that snap in magnetically. Each module is a self-contained device with its own co-processor, power regulation, and RGB — the host brain just discovers what’s plugged in and talks to it.
+A fully modular, ultra customizable macro pad system built around a CNC-machined aluminum core and a family of hot-swap I²C modules that snap in magnetically with a click. Each module is a self-contained device with its own co-processor, power regulation, and RGB — the host brain just discovers what’s plugged in and talks to it. Fully customizable via its own Acces Point and website, the built in OLED screen or the iOS and Android app(Coming Soon)
 
 Reconfigures itself for whatever you’re doing. No cables, no adapters, no reflashing.
+
+-----
+
+## Modules
+
+Every module ships with an ATtiny85 or CH32V003 co-processor, AMS1117 LDO (5V→3.3V), magnetic pogo pins on the sides and a WS2812B RGB strip in a machined aluminum channel behind frosted acrylic that goes along the bottom.
+
+**Brain** - 1.3” OLED SH1106 + 1x EC11 encoder + 2x Tactile Buttons and a USB-C connector. Powered by the ESP-32 S3 DevkitC.It controls and connects every module. It has a OLED screen and knobs and buttons for controlling the settings of the device. The features include changing keybinds, profiles, RGB and more. 
+
+**Knob + Slider** — 2× EC11 rotary encoders + 2× 75mm B10K linear faders with LED position strips. Allows for infinite customization possibilities. For example using the knobs at the top for switching what the faders under them do, or giving each one a completely diffrent control. Good for volume-brightness controls, MIDI CC, timeline scrubbing and color correction.
+
+**Button Matrix** — 4×4 hot-swap MX grid (Gateron Yellow/Red), 74HC165 shift register, full NKRO. Your classic macro pad with premium features and high customizability. Good for macros, layers, stream deck replacement.
 
 -----
 
@@ -33,26 +45,19 @@ Position determines I²C address — no DIP switches, no config jumpers.
 
 -----
 
-## Modules
-
-Every module ships with an ATtiny85 or CH32V003 co-processor, AMS1117 LDO (5V→3.3V), and a WS2812B RGB strip in a machined aluminum channel behind frosted acrylic.
-
-**Knob + Slider** — 2× EC11 rotary encoders + 2× 75mm B10K linear faders with LED position strips. Good for volume, MIDI CC, timeline scrubbing.
-
-**Button Matrix** — 4×4 hot-swap MX grid (Gateron Yellow/Red), 74HC165 shift register, full NKRO. Good for macros, layers, stream deck replacement.
-
------
-
 ## Status 🚧
 
 - [x] System architecture
 - [x] Pogo pin interface + magnet placement
 - [x] I²C addressing scheme
 - [x] Heartbeat/watchdog protocol
+- [x] Brain Protoype
+- [x] Control Site Protoype
 - [ ] Brain PCB layout
 - [ ] Module PCB layouts
 - [ ] CNC enclosure drawings
 - [ ] Firmware (ESP32-S3 host + module co-processors)
+- [ ] Mobile app (In Progress)
 - [ ] First prototype
 
 -----
