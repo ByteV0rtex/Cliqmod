@@ -239,4 +239,4 @@ All enclosures are CNC-machined aluminum. The RGB strip runs along the bottom ed
 
 -----
 
-*Built by Doruk Arpali*
+*Built by ByteVortex*
