@@ -2,7 +2,7 @@
 
 > A fully modular, magnetically connected macro pad system built from CNC-machined aluminum.
 
-Cliqmod is built around the idea that your tools should adapt to you — not the other way around. Snap on the modules you need, leave off the ones you don’t, and reconfigure everything from a browser without touching a line of code. No cables between modules. No adapters. No reflashing.
+Cliqmod is built around the idea that your tools should adapt to you — not the other way around. Snap on the modules you need, leave off the ones you don’t, and reconfigure everything from a browser (or the companion app) without touching a line of code. No cables between modules. No adapters. No reflashing.
 
 Every module is a self-contained device with its own co-processor, power regulation, and RGB accent lighting. The brain discovers what’s attached at boot, assigns I²C addresses automatically based on position, and starts talking to everything in seconds.
 
@@ -15,7 +15,7 @@ Every module is a self-contained device with its own co-processor, power regulat
 
 Most macro pads are a fixed grid of keys. You buy what exists and live with it. Cliqmod treats the macro pad as a platform — a brain with expansion slots. The brain handles USB HID output, WiFi configuration, and module discovery. The modules handle their own inputs locally and only interrupt the brain when something actually happens.
 
-The result is a system that scales. Add a knob and slider module on the left for your DAW. Add a button matrix on the right for your stream deck shortcuts. Rearrange them. Swap them out mid-session. The brain figures out what’s there.
+The result is a system that scales. Add a knob and slider module on the left for your DAW. Add a button matrix on the right for your stream deck shortcuts. Dock your iPhone in front and let it act as another surface entirely. Rearrange them. Swap them out mid-session. The brain figures out what’s there.
 
 -----
 
@@ -40,7 +40,7 @@ The RGB strip wraps around the front corners so every exposed face glows. Connec
 
 The brain runs two independent I²C buses — one for the left module chain, one for the right. This gives each side a fresh 400pF capacitance budget and means a fault on one side can’t bring down the other. A PCA9515 I²C buffer sits at each connector port for hot-plug protection and bus isolation.
 
-On boot the brain pulses the ADDR line to assign each module its position-based address, scans both chains, loads the last-used profile from flash, and brings up its WiFi access point. The whole process takes under two seconds.
+On boot the brain pulses the ADDR line to assign each module its position-based address, scans both chains, loads the last-used profile from flash, and brings up networking (see [Connectivity](#connectivity) below). The whole process takes under two seconds.
 
 The encoder and buttons on the top face are fully mappable — they fire HID shortcuts just like any module control. Hold the encoder to navigate the on-device menu. Press the buttons on the home screen to trigger their assigned macros.
 
@@ -92,13 +92,55 @@ Every key is independently mappable per profile. Layer support means 16 physical
 
 -----
 
+### iPhone Dock
+
+> A stand that turns your iPhone into another Cliqmod surface. Comes in two variants — with or without wireless charging.
+
+**Enclosure:** ~90×90×100mm CNC-machined aluminum base + angled stand (matches the brain/matrix footprint, sits at phone-viewing angle)  
+**Phone presence:** NFC tag (NTAG213/215) behind a non-metal window, plus coil-based placement detection on the charging variant  
+**Window insert:** acrylic or nylon cutout behind the coil/NFC tag — CNC aluminum blocks NFC reads and induces eddy-current losses in a Qi coil, so this section can't be solid metal like the rest of the enclosure
+
+**No-charging variant** — fully cable-free. The NFC tag is passive (powered by the phone's own NFC field, needs nothing from the module), and the co-processor's placement-detection draws so little current it runs fine off the shared pogo VCC bus like every other module. Nothing exits the enclosure at all.
+
+**Charging variant** — the Qi coil needs more current than the pogo bus is budgeted for, so it gets its own USB-C input. That cable exits low on the **back** edge through a small machined channel, the same way the Brain module's USB-C port already sits on its back panel — flat against the desk, not visible from the front or sides, but still technically a cable if you look from behind. Charging current never touches the shared pogo bus regardless.
+
+Both variants use the standard 7-pin pogo connector for I²C status reporting — "phone placed" / "phone removed" fires as a normal INT event to the brain, the same way a button press does.
+
+Placing the phone on the dock triggers the NFC tag, which opens the Cliqmod app directly to a chosen profile — no unlock required, works straight from the lock screen. The app then renders that profile as a virtual deck (see [Companion App](#companion-app)) or hands control to Config mode.
+
+**Example uses**
+
+- Drop your phone on the desk and have it auto-launch into Deck mode
+- Use the phone as a temporary extra 8-button surface without adding hardware modules
+- Charge passively while it doubles as a secondary macro screen
+
+-----
+
+## Companion App
+
+One SwiftUI app, two modes, talking to the same brain the physical modules talk to.
+
+**Deck mode** — renders the current profile as a virtual grid of buttons on the phone, matching the same static layout and backlight-style visual feedback as the physical modules. It's a second surface for the same profile data, not a separate app with its own state.
+
+**Config mode** — the mobile equivalent of the `192.168.4.1` web UI: assign mappings, switch profiles, check connected modules, rescan the chain. The web UI stays available as a zero-install fallback; the app is the richer, faster path when you have it installed.
+
+The app talks to the brain over the local network, not to a desktop companion app — so pairing works the same way regardless of what computer (or none) is plugged in via USB.
+
+-----
+
 ## How it works
 
 ### Architecture
 
-Each module runs its own co-processor (ATtiny85 or CH32V003). When a control changes — a key press, an encoder turn, a fader move — the co-processor sends its I²C address to the brain as an interrupt. The brain goes directly to that module for the event data. No polling. No shared interrupt line. No Ocreeb MK2-style cascade failure.
+Each module runs its own co-processor (ATtiny85 or CH32V003). When a control changes — a key press, an encoder turn, a fader move, a phone placed on the dock — the co-processor sends its I²C address to the brain as an interrupt. The brain goes directly to that module for the event data. No polling. No shared interrupt line. No Ocreeb MK2-style cascade failure.
 
 The brain regenerates the WS2812B RGB signal at each module rather than passing it through raw, so signal quality stays clean regardless of chain length.
+
+### Connectivity
+
+The brain tries to join a saved home WiFi network (STA mode) at boot. If no credentials are saved, or the join fails, it automatically falls back to broadcasting its own access point — so the device always works, even on an unfamiliar network, and initial setup never requires typing in a password blind.
+
+For app pairing, the brain doesn't rely on network discovery alone (mDNS/Bonjour-style discovery is unreliable across routers and OS versions). Instead the OLED can display a QR code — IP, port, and pairing token — for a one-scan pair from the app, regardless of what the network topology looks like that day.
 
 ### I²C addressing
 
@@ -134,7 +176,7 @@ All modules use the same connector on both sides. 2.54mm pitch, ~18mm wide, gold
 |6  |RGB   |WS2812B data, regenerated per module              |
 |7  |ADDR  |Position-assignment pulse line from brain         |
 
-Power budget: safe for 2–3 modules per side at full RGB brightness. Beyond that, voltage drop across pogo pin resistance becomes a factor.
+Power budget: safe for 2–3 modules per side at full RGB brightness. Beyond that, voltage drop across pogo pin resistance becomes a factor. The iPhone Dock's charging variant doesn't count against this budget since its coil runs off its own back-panel USB-C input; the no-charging variant runs entirely off the shared bus like any other module.
 
 -----
 
@@ -142,7 +184,7 @@ Power budget: safe for 2–3 modules per side at full RGB brightness. Beyond tha
 
 ### Web interface
 
-Cliqmod broadcasts a WiFi access point called **Cliqmod** (password: `cliqmod1`). Open `192.168.4.1` in any browser — no app, no drivers, no install.
+Cliqmod broadcasts a WiFi access point called **Cliqmod** (password: `cliqmod1`) when not joined to a home network. Open `192.168.4.1` in any browser — no app, no drivers, no install.
 
 From the web UI you can:
 
@@ -153,6 +195,10 @@ From the web UI you can:
 - Trigger a module rescan
 
 Supported key combo format: `CTRL+Z`, `SHIFT+ALT+F4`, `F5`, `ENTER`, `ESC`, `TAB`, `DELETE`, `BKSP`, `UP`, `DOWN`, `LEFT`, `RIGHT`
+
+### Companion app
+
+Same capabilities as the web UI (Config mode), plus Deck mode for using an iPhone as a virtual surface. See [Companion App](#companion-app) above for how it connects.
 
 ### On-device menu
 
@@ -178,7 +224,7 @@ Up to 8 profiles stored in flash. Each profile is a complete set of mappings —
 
 All enclosures are CNC-machined aluminum. The RGB strip runs along the bottom edge of each module, wraps around the front face corners, and diffuses through a frosted acrylic insert. Connected sides are flush — only exposed faces glow.
 
-**Alignment:** All modules align flush at the bottom edge. The knob+slider module is taller than the brain and sits higher — this is intentional, creating a stepped skyline layout rather than forcing everything to the same height.
+**Alignment:** All modules align flush at the bottom edge. The knob+slider module is taller than the brain and sits higher, and the iPhone Dock sits highest of all at its viewing angle — this is intentional, creating a stepped skyline layout rather than forcing everything to the same height.
 
 **Magnets:** 6×2mm neodymium magnets, minimum 5mm clearance from all PCB components.
 
@@ -189,6 +235,7 @@ All enclosures are CNC-machined aluminum. The RGB strip runs along the bottom ed
 |Brain        |~90 × 90 × 35mm   |
 |Knob+Slider  |~90 × 90 × 130mm  |
 |Button Matrix|~90 × 90 × 25mm   |
+|iPhone Dock  |~90 × 90 × 100mm  |
 
 -----
 
@@ -202,13 +249,15 @@ All enclosures are CNC-machined aluminum. The RGB strip runs along the bottom ed
 - [x] Web configuration interface (prototype)
 - [x] HID key mapping with combo parser
 - [x] Profile system with flash storage
+- [ ] Companion app — Deck mode + Config mode (in progress)
 - [ ] Brain PCB layout (KiCad)
 - [ ] Knob+Slider PCB layout
 - [ ] Button Matrix PCB layout
+- [ ] iPhone Dock design (Qi coil placement, NFC window, independent power input)
 - [ ] Module co-processor firmware (ATtiny85 / CH32V003)
 - [ ] CNC enclosure drawings (Fusion 360)
 - [ ] Full prototype build
-- [ ] Mobile app — iOS / Android (in progress)
+- [ ] STA/AP auto-fallback WiFi + QR pairing firmware
 
 -----
 
@@ -224,8 +273,11 @@ All enclosures are CNC-machined aluminum. The RGB strip runs along the bottom ed
 |Bus buffer|PCA9515 per connector port                     |
 |Shift reg |74HC165 (Button Matrix)                        |
 |Power reg |AMS1117 3.3V LDO per module                    |
+|Charging  |Qi wireless TX coil + IC (iPhone Dock, charging variant only — own back-panel USB-C supply)|
+|NFC       |NTAG213/215 (iPhone Dock auto-launch)           |
 |USB HID   |ESP32-S3 native USB (no USB bridge chip)       |
-|Config UI |Vanilla JS served from ESP32 over WiFi AP      |
+|Networking|WiFi STA with AP fallback, mDNS + QR pairing    |
+|Config UI |Vanilla JS served from ESP32 over WiFi (web), SwiftUI (app)|
 |Storage   |ESP32 NVS (non-volatile flash)                 |
 
 -----
