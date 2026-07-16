@@ -61,6 +61,7 @@
 #include <hd44780.h>
 #include <hd44780ioClass/hd44780_I2Cexp.h>
 #include <WiFi.h>
+#include <ESPmDNS.h>
 #include <WebServer.h>
 #include <Preferences.h>
 #include <ArduinoJson.h>
@@ -68,7 +69,7 @@
 #include <USBHIDKeyboard.h>
 
 // ── Version ──────────────────────────────────────────────────
-#define FW_VERSION "0.3.0"
+#define FW_VERSION "0.4.0"
 
 // ── LCD ──────────────────────────────────────────────────────
 #define LCD_COLS 16
@@ -110,6 +111,18 @@
 #define AP_SSID "Cliqmod"
 #define AP_PASS "cliqmod1"
 #define AP_IP   IPAddress(192, 168, 4, 1)
+#define MDNS_HOSTNAME "cliqmod"          // reachable at cliqmod.local when in STA mode
+#define WIFI_CONNECT_TIMEOUT_MS 15000    // how long to try joining a saved/submitted network
+#define WIFI_NVS_NAMESPACE "wifi_cfg"    // separate NVS namespace from profile storage
+
+// NOTE ON "semi-secure" credential storage:
+// This is a single XOR-with-repeating-key obfuscation, NOT encryption. It stops a saved
+// SSID/password from showing up as plain grep-able text if someone dumps the flash, but a
+// motivated attacker with the firmware source (or this file) can trivially reverse it.
+// Real protection requires ESP32 flash encryption, which needs eFuses burned via the
+// ESP-IDF toolchain (not plain Arduino IDE) and is a ONE-WAY, irreversible operation on the
+// chip — worth doing later if this ever leaves a trusted home network, not before.
+static const uint8_t WIFI_OBFUSCATION_KEY[4] = {0x5A, 0xC3, 0x91, 0x2E};
 
 // ── HID action types ─────────────────────────────────────────
 #define ACTION_NONE   0
@@ -129,11 +142,24 @@
 #define MODULE_BUTTONS     0x02
 
 // ── Module event types ───────────────────────────────────────
+// These are the raw event types a module co-processor reports over I2C.
 #define EVT_ENC_TURN      0x01
 #define EVT_ENC_CLICK     0x02
 #define EVT_ENC_HOLD_TURN 0x03
 #define EVT_FADER         0x04
 #define EVT_BUTTON        0x05
+
+// These are BRAIN-SIDE-ONLY event types used when matching/firing mappings for encoder
+// turns. The co-processor only reports EVT_ENC_TURN/EVT_ENC_HOLD_TURN with a signed delta —
+// it doesn't distinguish direction as a separate event type. Previously the brain fired the
+// *same* mapping regardless of turn direction, so "volume up" and "volume down" couldn't be
+// mapped to the same knob's two directions. The brain now derives one of these from the
+// delta's sign before matching against stored mappings; nothing about the module protocol
+// or the Mapping struct's on-flash layout changes.
+#define EVT_ENC_CW        0x11
+#define EVT_ENC_CCW       0x12
+#define EVT_ENC_HOLD_CW   0x13
+#define EVT_ENC_HOLD_CCW  0x14
 
 // ── Brain encoder click sources ──────────────────────────────
 // Brain encoder click can also trigger a macro
@@ -255,6 +281,14 @@ int           startupDots = 0;
 const char* menuItems[] = { "Profiles", "Mappings", "Modules", "WiFi", "About" };
 const int   MENU_COUNT  = 5;
 
+// ── Network state ────────────────────────────────────────────
+bool   wifiConnected  = false;   // true once STA join succeeds
+bool   isAPMode        = true;   // true whenever the AP is broadcasting (setup or fallback)
+String currentSTASSID  = "";     // SSID currently joined in STA mode, if any
+String lastWifiError   = "";     // human-readable reason the last join attempt failed
+bool   restartPending  = false;  // set after a successful join, restart happens in loop()
+unsigned long restartAtMillis = 0;
+
 // ============================================================
 //  CUSTOM LCD CHARS
 // ============================================================
@@ -337,6 +371,134 @@ void loadProfiles() {
   }
   prefs.end();
   Serial.printf("[NVS] Loaded %d profiles\n", profileCount);
+}
+
+// ============================================================
+//  WIFI CREDENTIAL STORAGE (semi-secure — see WIFI_OBFUSCATION_KEY note above)
+// ============================================================
+
+// XOR is its own inverse, so the same function obfuscates and de-obfuscates.
+// Operates on raw bytes (not a null-terminated string) so it's safe even if a
+// byte happens to XOR to 0x00 partway through — that's why this uses putBytes/
+// getBytes rather than putString/getString, which would silently truncate at
+// the first null byte.
+void xorBuffer(uint8_t *buf, size_t len) {
+  for (size_t i = 0; i < len; i++) {
+    buf[i] ^= WIFI_OBFUSCATION_KEY[i % sizeof(WIFI_OBFUSCATION_KEY)];
+  }
+}
+
+void saveWifiCreds(const String &ssid, const String &pass) {
+  uint8_t ssidBuf[33] = {0};  // max SSID 32 chars + null
+  uint8_t passBuf[65] = {0};  // max WPA2 password 64 chars + null
+  ssid.getBytes(ssidBuf, sizeof(ssidBuf));
+  pass.getBytes(passBuf, sizeof(passBuf));
+
+  xorBuffer(ssidBuf, sizeof(ssidBuf));
+  xorBuffer(passBuf, sizeof(passBuf));
+
+  prefs.begin(WIFI_NVS_NAMESPACE, false);
+  prefs.putBytes("ssid", ssidBuf, sizeof(ssidBuf));
+  prefs.putBytes("pass", passBuf, sizeof(passBuf));
+  prefs.putBool("hasCreds", true);
+  prefs.end();
+  Serial.println("[WIFI] Credentials saved (obfuscated)");
+}
+
+// Returns true if saved credentials were found; fills ssid/pass.
+bool loadWifiCreds(String &ssid, String &pass) {
+  prefs.begin(WIFI_NVS_NAMESPACE, true);
+  bool has = prefs.getBool("hasCreds", false);
+  if (!has) { prefs.end(); return false; }
+
+  uint8_t ssidBuf[33] = {0};
+  uint8_t passBuf[65] = {0};
+  prefs.getBytes("ssid", ssidBuf, sizeof(ssidBuf));
+  prefs.getBytes("pass", passBuf, sizeof(passBuf));
+  prefs.end();
+
+  xorBuffer(ssidBuf, sizeof(ssidBuf));
+  xorBuffer(passBuf, sizeof(passBuf));
+  ssidBuf[32] = '\0';  // guard against a corrupted/unterminated buffer
+  passBuf[64] = '\0';
+
+  ssid = String((char*)ssidBuf);
+  pass = String((char*)passBuf);
+  return true;
+}
+
+void forgetWifiCreds() {
+  prefs.begin(WIFI_NVS_NAMESPACE, false);
+  prefs.clear();
+  prefs.end();
+  Serial.println("[WIFI] Credentials forgotten");
+}
+
+void startAPMode() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(AP_SSID, AP_PASS);
+  isAPMode      = true;
+  wifiConnected = false;
+  currentSTASSID = "";
+  Serial.printf("[WIFI] AP mode — SSID '%s', IP %s\n",
+                AP_SSID, WiFi.softAPIP().toString().c_str());
+}
+
+// Attempts to join the given network. Assumes WiFi.mode() has already been set by the
+// caller (WIFI_STA for a clean boot-time attempt, WIFI_AP_STA if the AP needs to stay
+// alive so an in-progress HTTP request from the setup page doesn't get dropped mid-join).
+bool tryConnectSTA(const String &ssid, const String &pass, unsigned long timeoutMs) {
+  Serial.printf("[WIFI] Joining '%s'...\n", ssid.c_str());
+  WiFi.begin(ssid.c_str(), pass.c_str());
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
+    delay(250);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected  = true;
+    currentSTASSID = ssid;
+    lastWifiError  = "";
+    Serial.printf("[WIFI] Connected — IP %s\n", WiFi.localIP().toString().c_str());
+
+    if (MDNS.begin(MDNS_HOSTNAME)) {
+      MDNS.addService("http", "tcp", 80);
+      Serial.printf("[WIFI] mDNS up — http://%s.local\n", MDNS_HOSTNAME);
+    } else {
+      Serial.println("[WIFI] mDNS failed to start (non-fatal)");
+    }
+    return true;
+  }
+
+  wifiConnected = false;
+  lastWifiError = "Could not reach that network — check the password and try again";
+  Serial.println("[WIFI] Join failed/timed out");
+  // Only clear the STA connection attempt — NOT the radio. If this is called while
+  // WIFI_AP_STA is active (a join attempt from the setup page), passing true here would
+  // stop WiFi entirely and kill the AP mid-request, dropping the client before the
+  // failure response could even reach their browser.
+  WiFi.disconnect(false);
+  return false;
+}
+
+// Called once at boot. Tries saved credentials first; falls back to AP setup mode.
+void setupNetworking() {
+  String ssid, pass;
+  if (loadWifiCreds(ssid, pass) && ssid.length() > 0) {
+    WiFi.mode(WIFI_STA);
+    if (tryConnectSTA(ssid, pass, WIFI_CONNECT_TIMEOUT_MS)) {
+      isAPMode = false;
+      return;
+    }
+    // Saved credentials didn't work this time (router off, moved networks, etc.) —
+    // fall back to AP so the device is still reachable, without erasing what's saved.
+    startAPMode();
+    return;
+  }
+  // No credentials saved yet — first-run setup AP.
+  startAPMode();
 }
 
 // ============================================================
@@ -550,14 +712,22 @@ void pollModuleData(TwoWire &bus, Module *mods) {
     uint8_t value    = bus.read();
     if (evtType == 0) continue;
 
+    uint8_t fireEvt = evtType;  // what we actually match mappings against
+
     if (evtType == EVT_ENC_TURN || evtType == EVT_ENC_HOLD_TURN) {
       if (ctrlId < 4)
         mods[i].encValues[ctrlId] = constrain(mods[i].encValues[ctrlId] + delta, 0, 100);
+      // Bug fix: previously every turn fired the same mapping regardless of direction,
+      // so "volume up" and "volume down" couldn't both be mapped to one knob. Derive a
+      // direction-specific event type from the signed delta before matching.
+      bool cw = (delta > 0);
+      if (evtType == EVT_ENC_TURN) fireEvt = cw ? EVT_ENC_CW      : EVT_ENC_CCW;
+      else                         fireEvt = cw ? EVT_ENC_HOLD_CW : EVT_ENC_HOLD_CCW;
     } else if (evtType == EVT_FADER && ctrlId < 4) {
       mods[i].faderValues[ctrlId] = value;
     }
 
-    fireMappingForSource(mods[i].address, ctrlId, evtType);
+    fireMappingForSource(mods[i].address, ctrlId, fireEvt);
   }
 }
 
@@ -567,6 +737,38 @@ void IRAM_ATTR onIntRight() { intRightFlag = true; }
 // ============================================================
 //  INPUT
 // ============================================================
+
+// Shared by both the encoder and the right-button "next" action so navigation bounds
+// are always screen-aware. Previously the right button used a hardcoded max of 20
+// regardless of which screen was active — harmless on some screens, but on SCR_WIFI
+// (which only has 2 pages) it meant you could page forward but never wrap back to
+// page 0 without leaving the screen entirely.
+void navigateScreen(int dir) {
+  switch (currentScreen) {
+    case SCR_HOME:
+      activeProfile = (activeProfile + dir + profileCount) % profileCount;
+      displayDirty  = true;
+      break;
+    case SCR_MENU:
+      menuIndex    = (menuIndex + dir + MENU_COUNT) % MENU_COUNT;
+      displayDirty = true;
+      break;
+    case SCR_PROFILES:
+      menuIndex    = constrain(menuIndex + dir, 0, profileCount - 1);
+      displayDirty = true;
+      break;
+    case SCR_MAPPINGS:
+      mappingIndex = constrain(mappingIndex + dir, 0, MAX_MAPPINGS - 1);
+      displayDirty = true;
+      break;
+    case SCR_WIFI:
+      menuIndex    = (menuIndex + dir + 2) % 2;  // 2 pages: creds/status, then IP/URL
+      displayDirty = true;
+      break;
+    default:
+      break;
+  }
+}
 
 void readEncoder() {
   static uint8_t lastState = 0b11;
@@ -581,28 +783,7 @@ void readEncoder() {
     bool ccw = (state == 0b01);
 
     if (cw || ccw) {
-      int dir = cw ? 1 : -1;
-
-      switch (currentScreen) {
-        case SCR_HOME:
-          activeProfile = (activeProfile + dir + profileCount) % profileCount;
-          displayDirty  = true;
-          break;
-        case SCR_MENU:
-          menuIndex    = (menuIndex + dir + MENU_COUNT) % MENU_COUNT;
-          displayDirty = true;
-          break;
-        case SCR_PROFILES:
-          menuIndex    = constrain(menuIndex + dir, 0, profileCount - 1);
-          displayDirty = true;
-          break;
-        case SCR_MAPPINGS:
-          mappingIndex = constrain(mappingIndex + dir, 0, MAX_MAPPINGS - 1);
-          displayDirty = true;
-          break;
-        default:
-          break;
-      }
+      navigateScreen(cw ? 1 : -1);
     }
   }
   lastState = state;
@@ -695,9 +876,8 @@ void readButtons() {
         // Short click on home fires right button macro
         fireMappingForSource(SRC_BRAIN_BTN_RIGHT, 0, 0);
       } else {
-        // In menus, right goes forward/next
-        menuIndex = constrain(menuIndex + 1, 0, 20);
-        displayDirty = true;
+        // In menus, right goes forward/next — same screen-aware logic as the encoder
+        navigateScreen(1);
       }
     }
   }
@@ -851,12 +1031,26 @@ void drawMappingDetail() {
 }
 
 void drawWifi() {
-  if (menuIndex == 0) {
-    lcd.setCursor(0, 0); lcdPrint("SSID: Cliqmod   ", 16);
-    lcd.setCursor(0, 1); lcdPrint("Pass: cliqmod1  ", 16);
+  if (!isAPMode && wifiConnected) {
+    // Connected to home WiFi (STA mode)
+    if (menuIndex == 0) {
+      char r0[17]; sprintf(r0, "%-16s", currentSTASSID.c_str());
+      lcd.setCursor(0, 0); lcdPrint(r0, 16);
+      lcd.setCursor(0, 1); lcdPrint("Connected       ", 16);
+    } else {
+      char r1[17]; sprintf(r1, "%-16s", WiFi.localIP().toString().c_str());
+      lcd.setCursor(0, 0); lcdPrint("IP:             ", 16);
+      lcd.setCursor(0, 1); lcdPrint(r1, 16);
+    }
   } else {
-    lcd.setCursor(0, 0); lcdPrint("Open browser:   ", 16);
-    lcd.setCursor(0, 1); lcdPrint("192.168.4.1     ", 16);
+    // Setup/fallback AP mode
+    if (menuIndex == 0) {
+      lcd.setCursor(0, 0); lcdPrint("SSID: " AP_SSID "   ", 16);
+      lcd.setCursor(0, 1); lcdPrint("Pass: " AP_PASS "  ", 16);
+    } else {
+      lcd.setCursor(0, 0); lcdPrint("Open browser:   ", 16);
+      lcd.setCursor(0, 1); lcdPrint("192.168.4.1     ", 16);
+    }
   }
 }
 
@@ -937,10 +1131,81 @@ String sourceToString(uint8_t src) {
   return String(buf);
 }
 
+String moduleTypeToString(uint8_t t) {
+  switch (t) {
+    case MODULE_KNOB_SLIDER: return "knob_slider";
+    case MODULE_BUTTONS:     return "buttons";
+    default:                 return "unknown";
+  }
+}
+
+String eventTypeToString(uint8_t e) {
+  switch (e) {
+    case EVT_ENC_TURN:      return "enc_turn";
+    case EVT_ENC_CLICK:     return "enc_click";
+    case EVT_ENC_HOLD_TURN: return "enc_hold_turn";
+    case EVT_FADER:         return "fader";
+    case EVT_BUTTON:        return "button";
+    case EVT_ENC_CW:        return "enc_cw";
+    case EVT_ENC_CCW:       return "enc_ccw";
+    case EVT_ENC_HOLD_CW:   return "enc_hold_cw";
+    case EVT_ENC_HOLD_CCW:  return "enc_hold_ccw";
+    default:                return "none";
+  }
+}
+
+// strncpy doesn't guarantee null-termination if src is >= destSize chars long — the
+// original /api/mappings handler had exactly this bug: a label of 19+ chars from a
+// client request could leave mp.label unterminated, and every later read of it
+// (LCD printing, JSON serialization) would run past the buffer into whatever struct
+// field happens to sit next in memory. This always truncates safely.
+void safeCopy(char *dest, const char *src, size_t destSize) {
+  strncpy(dest, src, destSize - 1);
+  dest[destSize - 1] = '\0';
+}
+
+void writeModuleJson(JsonArray &modArr, Module *mods, const char *side) {
+  for (int i = 0; i < 3; i++) {
+    Module &mod = mods[i];
+    JsonObject m = modArr.createNestedObject();
+    m["present"] = mod.present;
+    m["label"]   = mod.present ? mod.label : "";
+    m["side"]    = side;
+    m["pos"]     = i + 1;
+    m["address"] = mod.present ? mod.address : 0;
+    m["type"]    = mod.present ? moduleTypeToString(mod.type) : "unknown";
+
+    if (mod.present && mod.type == MODULE_KNOB_SLIDER) {
+      JsonArray enc = m.createNestedArray("encValues");
+      JsonArray fad = m.createNestedArray("faderValues");
+      for (int k = 0; k < 4; k++) { enc.add(mod.encValues[k]); fad.add(mod.faderValues[k]); }
+    }
+  }
+}
+
 String buildStateJson() {
-  DynamicJsonDocument doc(8192);
+  // Bumped from 8192: with controlId/eventType/eventTypeLabel added to every mapping and
+  // address/type/live values added to every module, a fully populated profile set
+  // (8 profiles x 48 mappings) needs meaningfully more room than before.
+  // Sized for the realistic worst case, not just typical usage: with MAX_PROFILES=8 and
+  // MAX_MAPPINGS=48, a fully populated set (unlikely in practice given the hardware only
+  // exposes a few dozen physical controls, but the firmware doesn't prevent it) can need
+  // ~50-65KB once every mapping carries id/label/source/srcCode/controlId/eventType/
+  // eventTypeLabel/keycombo/isString. ArduinoJson doesn't error when a DynamicJsonDocument
+  // runs out of room — it silently drops entries — so undersizing this is a silent-data-
+  // loss bug, not a crash. This is a one-off transient heap allocation per request; the
+  // ESP32-S3 has RAM to spare for it.
+  DynamicJsonDocument doc(32768);
   doc["activeProfile"] = activeProfile;
   doc["firmware"]      = FW_VERSION;
+
+  JsonObject net = doc.createNestedObject("network");
+  net["mode"]      = isAPMode ? "ap" : "sta";
+  net["connected"] = wifiConnected;
+  net["ssid"]      = isAPMode ? AP_SSID : currentSTASSID;
+  net["ip"]        = isAPMode ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+  net["hostname"]  = String(MDNS_HOSTNAME) + ".local";
+  net["lastError"] = lastWifiError;
 
   JsonArray profArr = doc.createNestedArray("profiles");
   for (int i = 0; i < profileCount; i++) {
@@ -951,27 +1216,76 @@ String buildStateJson() {
       Mapping &m = profiles[i].mappings[j];
       if (!m.active) continue;
       JsonObject mo = maps.createNestedObject();
-      mo["id"]      = j;
-      mo["label"]   = m.label;
-      mo["source"]  = sourceToString(m.source);
-      mo["srcCode"] = m.source;
-      mo["keycombo"] = actionToComboString(m.action);
-      mo["isString"] = (m.action.type == ACTION_STRING);
+      mo["id"]        = j;
+      mo["label"]     = m.label;
+      mo["source"]    = sourceToString(m.source);
+      mo["srcCode"]   = m.source;
+      mo["controlId"] = m.controlId;
+      mo["eventType"] = m.eventType;
+      mo["eventTypeLabel"] = eventTypeToString(m.eventType);
+      mo["keycombo"]  = actionToComboString(m.action);
+      mo["isString"]  = (m.action.type == ACTION_STRING);
     }
   }
 
   JsonArray modArr = doc.createNestedArray("modules");
-  for (int i = 0; i < 3; i++) {
-    JsonObject m = modArr.createNestedObject();
-    m["present"] = leftModules[i].present;
-    m["label"]   = leftModules[i].present ? leftModules[i].label : "";
-    m["side"]    = "L"; m["pos"] = i + 1;
-  }
-  for (int i = 0; i < 3; i++) {
-    JsonObject m = modArr.createNestedObject();
-    m["present"] = rightModules[i].present;
-    m["label"]   = rightModules[i].present ? rightModules[i].label : "";
-    m["side"]    = "R"; m["pos"] = i + 1;
+  writeModuleJson(modArr, leftModules,  "L");
+  writeModuleJson(modArr, rightModules, "R");
+
+  String out; serializeJson(doc, out); return out;
+}
+
+// Enumerates every mappable (source, controlId, eventType) combination available right
+// now, given which modules are actually connected. This is what lets a client (web UI or
+// the future app) build a source picker dynamically instead of hardcoding 3 brain-only
+// options — closing the gap where module controls existed in the Mapping struct but had
+// no way to actually be assigned through the API.
+String buildSourcesJson() {
+  DynamicJsonDocument doc(4096);
+  JsonArray arr = doc.createNestedArray("sources");
+
+  auto addSource = [&](uint8_t src, uint8_t ctrl, uint8_t evt, const String &label) {
+    JsonObject o = arr.createNestedObject();
+    o["srcCode"]        = src;
+    o["controlId"]      = ctrl;
+    o["eventType"]      = evt;
+    o["eventTypeLabel"] = eventTypeToString(evt);
+    o["label"]          = label;
+  };
+
+  addSource(SRC_BRAIN_ENC_CLICK, 0, 0, "Brain Enc Click");
+  addSource(SRC_BRAIN_BTN_LEFT,  0, 0, "Brain Btn Left");
+  addSource(SRC_BRAIN_BTN_RIGHT, 0, 0, "Brain Btn Right");
+
+  for (int side = 0; side < 2; side++) {
+    Module *mods = side == 0 ? leftModules : rightModules;
+    const char *sideLabel = side == 0 ? "L" : "R";
+    for (int i = 0; i < 3; i++) {
+      if (!mods[i].present) continue;
+      char prefix[8]; sprintf(prefix, "%s%d", sideLabel, i + 1);
+
+      if (mods[i].type == MODULE_KNOB_SLIDER) {
+        for (int ctrl = 0; ctrl < 2; ctrl++) {
+          char lbl[24];
+          sprintf(lbl, "%s Enc%d CW",  prefix, ctrl + 1);
+          addSource(mods[i].address, ctrl, EVT_ENC_CW, lbl);
+          sprintf(lbl, "%s Enc%d CCW", prefix, ctrl + 1);
+          addSource(mods[i].address, ctrl, EVT_ENC_CCW, lbl);
+          sprintf(lbl, "%s Enc%d Click", prefix, ctrl + 1);
+          addSource(mods[i].address, ctrl, EVT_ENC_CLICK, lbl);
+        }
+        for (int ctrl = 0; ctrl < 2; ctrl++) {
+          char lbl[24];
+          sprintf(lbl, "%s Fader%d", prefix, ctrl + 1);
+          addSource(mods[i].address, ctrl, EVT_FADER, lbl);
+        }
+      } else if (mods[i].type == MODULE_BUTTONS) {
+        for (int ctrl = 0; ctrl < 16; ctrl++) {
+          char lbl[24]; sprintf(lbl, "%s Key%d", prefix, ctrl + 1);
+          addSource(mods[i].address, ctrl, EVT_BUTTON, lbl);
+        }
+      }
+    }
   }
 
   String out; serializeJson(doc, out); return out;
@@ -1057,26 +1371,29 @@ input:focus,select:focus{border-color:#444}
 </div>
 
 <div class="card">
+  <div class="card-title">Network</div>
+  <div id="networkPanel"></div>
+</div>
+
+<div class="card">
   <div class="card-title">System</div>
   <div id="sysInfo"></div>
-  <hr class="sep">
-  <div class="card-title" style="margin-top:8px">WiFi</div>
-  <div class="info-row"><span>SSID</span><span class="info-val">Cliqmod</span></div>
-  <div class="info-row"><span>Password</span><span class="info-val">cliqmod1</span></div>
-  <div class="info-row"><span>URL</span><span class="info-val">192.168.4.1</span></div>
 </div>
 
 <div class="toast" id="toast"></div>
 
 <script>
-const SOURCES = [
-  {label:'Enc Click', code:0xF0},
-  {label:'Btn Left',  code:0xF1},
-  {label:'Btn Right', code:0xF2}
-];
-
-let state   = {profiles:[], activeProfile:0, modules:[], firmware:''};
+let SOURCES = [];  // fetched from /api/sources — grows as modules are connected
+let state   = {profiles:[], activeProfile:0, modules:[], firmware:'', network:{}};
 let pending = null; // pending changes before save
+
+async function loadSources() {
+  try {
+    const r = await fetch('/api/sources');
+    const s = await r.json();
+    SOURCES = s.sources;
+  } catch(e) { /* keep previous list on failure */ }
+}
 
 async function load() {
   try {
@@ -1084,6 +1401,7 @@ async function load() {
     const s = await r.json();
     state   = s;
     pending = JSON.parse(JSON.stringify(s.profiles)); // deep copy
+    await loadSources();
     render();
   } catch(e) {
     document.getElementById('subline').textContent = 'Connection lost';
@@ -1097,6 +1415,7 @@ function render() {
   renderModules();
   renderMappings();
   renderSys();
+  renderNetwork();
 }
 
 function renderProfiles() {
@@ -1147,8 +1466,8 @@ function renderMappings() {
       <div class="card-title" style="margin-bottom:6px">Source</div>
       <div class="src-select">
         ${SOURCES.map(s =>
-          `<div class="src-btn ${m.srcCode===s.code?'active':''}"
-               onclick="setSource(${i},${s.code})">${s.label}</div>`
+          `<div class="src-btn ${isSameSource(m,s)?'active':''}"
+               onclick="setSource(${i},${s.srcCode},${s.controlId},${s.eventType})">${s.label}</div>`
         ).join('')}
       </div>
       <div class="mapping-fields">
@@ -1157,16 +1476,30 @@ function renderMappings() {
           <input id="lbl${i}" value="${m.label||''}" placeholder="e.g. Undo" oninput="updateField(${i})">
         </div>
         <div class="field">
-          <label>Key Combo</label>
-          <input id="key${i}" value="${m.keycombo||''}" placeholder="e.g. CTRL+Z" oninput="updateField(${i})">
+          <label>${m.isString ? 'Text to type' : 'Key Combo'}</label>
+          <input id="key${i}" value="${m.keycombo||''}" placeholder="${m.isString ? 'e.g. hello@cliqmod.dev' : 'e.g. CTRL+Z'}" oninput="updateField(${i})">
         </div>
       </div>
+      <label style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:12px;color:#888;cursor:pointer">
+        <input type="checkbox" id="str${i}" ${m.isString?'checked':''} onchange="updateField(${i})" style="width:auto">
+        Type literal text instead of a key combo
+      </label>
     </div>
   `).join('');
 }
 
-function setSource(i, code) {
-  pending[state.activeProfile].mappings[i].srcCode = code;
+// A mapping and a source entry refer to the same thing only if all three identifying
+// fields match — srcCode alone isn't enough once a module address can host several
+// distinct mappable controls (e.g. one Knob+Slider has 6+ separate sources).
+function isSameSource(m, s) {
+  return m.srcCode === s.srcCode && (m.controlId||0) === s.controlId && (m.eventType||0) === s.eventType;
+}
+
+function setSource(i, srcCode, controlId, eventType) {
+  const m = pending[state.activeProfile].mappings[i];
+  m.srcCode   = srcCode;
+  m.controlId = controlId;
+  m.eventType = eventType;
   renderMappings();
 }
 
@@ -1174,11 +1507,16 @@ function updateField(i) {
   const maps = pending[state.activeProfile].mappings;
   maps[i].label    = document.getElementById('lbl'+i).value;
   maps[i].keycombo = document.getElementById('key'+i).value;
+  const strBox = document.getElementById('str'+i);
+  if (strBox) maps[i].isString = strBox.checked;
+  renderMappings();
 }
 
 function addMapping() {
+  const first = SOURCES[0] || {srcCode:0xF0, controlId:0, eventType:0};
   pending[state.activeProfile].mappings.push({
-    label:'', keycombo:'', srcCode:0xF0, source:'Brain Enc Click'
+    label:'', keycombo:'', isString:false,
+    srcCode: first.srcCode, controlId: first.controlId, eventType: first.eventType
   });
   renderMappings();
   // Scroll to bottom
@@ -1196,8 +1534,10 @@ async function saveAll() {
   maps.forEach((_,i) => {
     const lbl = document.getElementById('lbl'+i);
     const key = document.getElementById('key'+i);
+    const str = document.getElementById('str'+i);
     if (lbl) maps[i].label    = lbl.value;
     if (key) maps[i].keycombo = key.value;
+    if (str) maps[i].isString = str.checked;
   });
 
   const body = JSON.stringify({
@@ -1235,6 +1575,74 @@ function renderSys() {
     <div class="info-row"><span>Modules Left</span><span class="info-val">${lMods} / 3</span></div>
     <div class="info-row"><span>Modules Right</span><span class="info-val">${rMods} / 3</span></div>
   `;
+}
+
+function renderNetwork() {
+  const net = state.network || {};
+  const panel = document.getElementById('networkPanel');
+
+  if (net.mode === 'sta' && net.connected) {
+    panel.innerHTML = `
+      <div class="info-row"><span>Status</span><span class="info-val" style="color:#4ade80">Connected</span></div>
+      <div class="info-row"><span>Network</span><span class="info-val">${net.ssid}</span></div>
+      <div class="info-row"><span>IP</span><span class="info-val">${net.ip}</span></div>
+      <div class="info-row"><span>Hostname</span><span class="info-val">${net.hostname}</span></div>
+      <div class="btn-row">
+        <button class="btn btn-danger btn-small" onclick="forgetWifi()">Forget This Network</button>
+      </div>
+    `;
+    return;
+  }
+
+  // AP / setup mode — show how to join the setup AP, plus a form to join a real network
+  panel.innerHTML = `
+    <div class="info-row"><span>Setup AP</span><span class="info-val">${net.ssid || 'Cliqmod'}</span></div>
+    <div class="info-row"><span>Setup Password</span><span class="info-val">cliqmod1</span></div>
+    <div class="info-row"><span>This page</span><span class="info-val">192.168.4.1</span></div>
+    ${net.lastError ? `<div class="info-row"><span style="color:#f87171">${net.lastError}</span></div>` : ''}
+    <hr class="sep">
+    <div class="card-title" style="margin-top:4px">Join Your WiFi</div>
+    <div class="mapping-fields">
+      <div class="field"><label>Network Name</label><input id="wifiSsid" placeholder="Your home WiFi"></div>
+      <div class="field"><label>Password</label><input id="wifiPass" type="password" placeholder="••••••••"></div>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="joinWifi()">Connect</button>
+    </div>
+    <p style="font-size:11px;color:#444;margin-top:8px">
+      The device will try this network and restart into it if successful. Stay on the
+      Cliqmod setup WiFi while it connects — this page will lose connection once it restarts.
+    </p>
+  `;
+}
+
+async function joinWifi() {
+  const ssid = document.getElementById('wifiSsid').value;
+  const password = document.getElementById('wifiPass').value;
+  if (!ssid) { toast('Enter a network name'); return; }
+  toast('Connecting... this can take up to 15s');
+  try {
+    const r = await fetch('/api/wifi/join', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ssid, password})
+    });
+    const s = await r.json();
+    if (s.ok) {
+      toast('Connected! Restarting into ' + ssid + '...');
+    } else {
+      toast(s.error || 'Could not connect');
+      await load();
+    }
+  } catch(e) {
+    toast('Request failed — still on setup AP?');
+  }
+}
+
+async function forgetWifi() {
+  if (!confirm('Forget this network and restart into setup mode?')) return;
+  await fetch('/api/wifi/forget', {method:'POST'});
+  toast('Forgetting network, restarting...');
 }
 
 function toast(msg) {
@@ -1276,7 +1684,12 @@ void setupWebServer() {
 
   server.on("/api/mappings", HTTP_POST, []() {
     if (!server.hasArg("plain")) { server.send(400); return; }
-    DynamicJsonDocument doc(4096);
+    // Bumped from 4096: MAX_MAPPINGS=48 entries, each now with a few more fields
+    // (controlId, eventType, isString), can run close to the old ceiling.
+    // A single profile's worth (up to 48 mappings) with the added controlId/eventType/
+    // isString fields ran close to the old 8192 ceiling in a rough worst-case estimate —
+    // bumped for headroom rather than risk silently truncated saves.
+    DynamicJsonDocument doc(16384);
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
     if (err) { server.send(400, "application/json", "{\"error\":\"parse\"}"); return; }
 
@@ -1297,14 +1710,28 @@ void setupWebServer() {
 
       const char *label    = m["label"]    | "";
       const char *keycombo = m["keycombo"] | "";
-      uint8_t     srcCode  = m["srcCode"]  | (uint8_t)SRC_BRAIN_ENC_CLICK;
+      uint8_t     srcCode  = m["srcCode"]   | (uint8_t)SRC_BRAIN_ENC_CLICK;
+      // Default to 0/0 so old clients that only ever sent brain sources still work —
+      // brain mappings always use controlId=0, eventType=0.
+      uint8_t     controlId = m["controlId"] | 0;
+      uint8_t     eventType = m["eventType"] | 0;
+      bool        isString  = m["isString"]  | false;
 
-      strncpy(mp.label, label, 19);
+      safeCopy(mp.label, label, sizeof(mp.label));
       mp.source    = srcCode;
-      mp.controlId = 0;
-      mp.eventType = 0;
-      mp.action    = parseKeyCombo(keycombo);
-      mp.active    = (strlen(label) > 0 || strlen(keycombo) > 0);
+      mp.controlId = controlId;
+      mp.eventType = eventType;
+
+      if (isString) {
+        mp.action.type     = ACTION_STRING;
+        mp.action.modifier = 0;
+        mp.action.keycode  = 0;
+        safeCopy(mp.action.str, keycombo, sizeof(mp.action.str));
+      } else {
+        mp.action = parseKeyCombo(keycombo);
+      }
+
+      mp.active = (strlen(label) > 0 || strlen(keycombo) > 0);
       slot++;
     }
 
@@ -1312,6 +1739,58 @@ void setupWebServer() {
     displayDirty  = true;
     lcdNeedsClear = true;
     server.send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/api/sources", HTTP_GET, []() {
+    server.send(200, "application/json", buildSourcesJson());
+  });
+
+  // Called from the setup AP (or from STA mode, to switch networks). Attempts the join
+  // synchronously — WIFI_AP_STA keeps the AP interface alive throughout so this request's
+  // own response can still make it back to the client even if the join fails or is slow.
+  server.on("/api/wifi/join", HTTP_POST, []() {
+    if (!server.hasArg("plain")) { server.send(400); return; }
+    DynamicJsonDocument doc(256);
+    if (deserializeJson(doc, server.arg("plain"))) { server.send(400); return; }
+
+    String ssid = doc["ssid"]     | "";
+    String pass = doc["password"] | "";
+    if (ssid.length() == 0) {
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"SSID required\"}");
+      return;
+    }
+
+    WiFi.mode(WIFI_AP_STA);  // keep the setup AP alive during the attempt
+    bool ok = tryConnectSTA(ssid, pass, WIFI_CONNECT_TIMEOUT_MS);
+
+    if (ok) {
+      saveWifiCreds(ssid, pass);
+      isAPMode = false;
+      DynamicJsonDocument resp(256);
+      resp["ok"] = true;
+      resp["ip"] = WiFi.localIP().toString();
+      String out; serializeJson(resp, out);
+      server.send(200, "application/json", out);
+      // Restart shortly after so the device comes up cleanly in pure STA mode next boot,
+      // rather than staying in the current AP_STA hybrid state indefinitely.
+      restartPending  = true;
+      restartAtMillis = millis() + 2000;
+    } else {
+      // Don't save bad credentials — drop back to pure AP so setup stays usable.
+      startAPMode();
+      DynamicJsonDocument resp(256);
+      resp["ok"]    = false;
+      resp["error"] = lastWifiError;
+      String out; serializeJson(resp, out);
+      server.send(200, "application/json", out);
+    }
+  });
+
+  server.on("/api/wifi/forget", HTTP_POST, []() {
+    forgetWifiCreds();
+    server.send(200, "application/json", "{\"ok\":true}");
+    restartPending  = true;
+    restartAtMillis = millis() + 1000;
   });
 
   server.on("/api/rescan", HTTP_POST, []() {
@@ -1374,10 +1853,8 @@ void setup() {
   // Storage
   loadProfiles();
 
-  // WiFi + web
-  WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255,255,255,0));
-  WiFi.softAP(AP_SSID, AP_PASS);
+  // WiFi + web — tries saved credentials (STA) first, falls back to setup AP
+  setupNetworking();
   setupWebServer();
 
   // Startup
@@ -1441,6 +1918,15 @@ void loop() {
 
   // Web
   server.handleClient();
+
+  // Deferred restart (after a successful /api/wifi/join or /api/wifi/forget) — done here
+  // rather than inside the handler so the HTTP response has time to actually leave the
+  // TCP socket before the device reboots.
+  if (restartPending && millis() >= restartAtMillis) {
+    Serial.println("[SYSTEM] Restarting...");
+    delay(50);
+    ESP.restart();
+  }
 
   // Display
   updateDisplay();
