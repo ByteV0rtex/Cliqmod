@@ -61,6 +61,8 @@ struct MappingEditorView: View {
             }
             .navigationTitle(existing == nil ? "New Mapping" : "Edit Mapping")
             .navigationBarTitleDisplayMode(.inline)
+            .darkListStyle()
+            .listRowBackground(Theme.card)
             .onAppear {
                 if let existing, selectedSource == nil {
                     selectedSource = store.sources.first {

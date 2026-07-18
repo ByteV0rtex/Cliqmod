@@ -5,7 +5,6 @@
 //  Created by Doruk Arpali on 18.07.2026.
 //
 
-
 import SwiftUI
 
 struct ConfigView: View {
@@ -44,8 +43,16 @@ struct ConfigView: View {
                     }
                 }
             }
+            .listRowBackground(Theme.card)
             .navigationTitle("Config")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        store.currentTab = .deck
+                    } label: {
+                        Image(systemName: "square.grid.3x2.fill")
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         Task {
@@ -59,6 +66,7 @@ struct ConfigView: View {
                     }
                 }
             }
+            .darkListStyle()
             .sheet(item: $editingMapping) { mapping in
                 if let state = store.state {
                     MappingEditorView(profileIndex: state.activeProfile, existing: mapping) { payload in
@@ -73,6 +81,9 @@ struct ConfigView: View {
                     }
                 }
             }
+        }
+        .onAppear {
+            OrientationController.lockPortrait()
         }
     }
 

@@ -9,10 +9,16 @@
 import Foundation
 import Observation
 
+enum AppTab {
+    case deck, config
+}
+
 @MainActor
 @Observable
 final class CliqmodStore {
     let client: CliqmodClient
+
+    var currentTab: AppTab = .deck
 
     private(set) var state: CliqmodState?
     private(set) var sources: [SourceEntry] = []

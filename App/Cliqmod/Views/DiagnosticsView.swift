@@ -24,6 +24,8 @@ struct DiagnosticsView: View {
             }
         }
         .navigationTitle("Diagnostics")
+        .darkListStyle()
+        .listRowBackground(Theme.card)
         .refreshable { await store.refresh() }
     }
 

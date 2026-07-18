@@ -101,6 +101,8 @@ struct ActionEditorView: View {
             }
             .navigationTitle("Edit Button")
             .navigationBarTitleDisplayMode(.inline)
+            .darkListStyle()
+            .listRowBackground(Theme.card)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }

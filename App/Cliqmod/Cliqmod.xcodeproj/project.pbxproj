@@ -6,8 +6,15 @@
 	objectVersion = 90;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		51136AFF300C14CD00D97291 /* OrientationController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51136AFE300C14CD00D97291 /* OrientationController.swift */; };
+		51136B01300C152100D97291 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51136B00300C152100D97291 /* Theme.swift */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		000000000000000000000120 /* Cliqmod.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Cliqmod.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		51136AFE300C14CD00D97291 /* OrientationController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrientationController.swift; sourceTree = "<group>"; };
+		51136B00300C152100D97291 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -35,6 +42,8 @@
 		000000000000000000000001 = {
 			isa = PBXGroup;
 			children = (
+				51136B00300C152100D97291 /* Theme.swift */,
+				51136AFE300C14CD00D97291 /* OrientationController.swift */,
 				51136AEB300B954800D97291 /* Backend */,
 				000000000000000000000010 /* Views */,
 				000000000000000000000020 /* Products */,
@@ -117,6 +126,8 @@
 		000000000000000120000000 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			files = (
+				51136AFF300C14CD00D97291 /* OrientationController.swift in Sources */,
+				51136B01300C152100D97291 /* Theme.swift in Sources */,
 			);
 		};
 /* End PBXSourcesBuildPhase section */

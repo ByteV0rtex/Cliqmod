@@ -17,11 +17,11 @@ struct RootView: View {
                 if state.network.mode == "ap" {
                     PairingView()
                 } else {
-                    TabView {
+                    switch store.currentTab {
+                    case .deck:
                         DeckView()
-                            .tabItem { Label("Deck", systemImage: "square.grid.3x2.fill") }
+                    case .config:
                         ConfigView()
-                            .tabItem { Label("Config", systemImage: "slider.horizontal.3") }
                     }
                 }
             } else if let error = store.lastError {
@@ -32,11 +32,18 @@ struct RootView: View {
                 } actions: {
                     Button("Retry") { Task { await store.refresh() } }
                 }
+                .background(Theme.background)
             } else {
-                ProgressView("Connecting to Cliqmod...")
+                ZStack {
+                    Theme.background.ignoresSafeArea()
+                    ProgressView("Connecting to Cliqmod...")
+                        .tint(Theme.accent)
+                }
             }
         }
         .environment(store)
+        .preferredColorScheme(.dark)
+        .tint(Theme.accent)
         .task {
             store.startPolling()
         }
@@ -45,6 +52,8 @@ struct RootView: View {
 
 @main
 struct CliqmodApp: App {
+    @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+
     var body: some Scene {
         WindowGroup {
             RootView()

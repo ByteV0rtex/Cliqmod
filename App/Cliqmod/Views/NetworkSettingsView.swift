@@ -1,5 +1,5 @@
 //
-//  WifiJoinFormView.swift
+//  NetworkSettingsView.swift
 //  Cliqmod
 //
 //  Created by Doruk Arpali on 18.07.2026.
@@ -72,7 +72,7 @@ struct PairingView: View {
             VStack(spacing: 24) {
                 Image(systemName: "keyboard.badge.ellipsis")
                     .font(.system(size: 56))
-                    .foregroundStyle(.blue)
+                    .foregroundStyle(Theme.accent)
                     .padding(.top, 60)
 
                 VStack(spacing: 8) {
@@ -87,9 +87,13 @@ struct PairingView: View {
 
                 WifiJoinFormView()
                     .padding()
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    .background(Theme.card, in: RoundedRectangle(cornerRadius: 16))
                     .padding(.horizontal)
             }
+        }
+        .background(Theme.background.ignoresSafeArea())
+        .onAppear {
+            OrientationController.lockPortrait()
         }
     }
 }
@@ -119,5 +123,7 @@ struct NetworkSettingsView: View {
             }
         }
         .navigationTitle("Network")
+        .darkListStyle()
+        .listRowBackground(Theme.card)
     }
 }
