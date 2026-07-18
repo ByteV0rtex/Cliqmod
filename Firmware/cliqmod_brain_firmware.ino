@@ -289,6 +289,13 @@ String lastWifiError   = "";     // human-readable reason the last join attempt 
 bool   restartPending  = false;  // set after a successful join, restart happens in loop()
 unsigned long restartAtMillis = 0;
 
+// ── Diagnostics ──────────────────────────────────────────────
+#define POWER_BUDGET_MAX_PER_SIDE 3   // matches the README's "safe for 2-3 modules per side"
+uint32_t busRecoveriesLeft  = 0;
+uint32_t busRecoveriesRight = 0;
+unsigned long lastHeartbeatOkLeft  = 0;
+unsigned long lastHeartbeatOkRight = 0;
+
 // ============================================================
 //  CUSTOM LCD CHARS
 // ============================================================
@@ -678,23 +685,57 @@ void assignAddresses(int addrPin, TwoWire &bus,
 
 void pingModules() {
   bool changed = false;
+  int presentBeforeLeft = 0, failedLeft = 0;
+  int presentBeforeRight = 0, failedRight = 0;
+
   for (int i = 0; i < 3; i++) {
     if (leftModules[i].present) {
+      presentBeforeLeft++;
       WireLeft.beginTransmission(leftModules[i].address);
       if (WireLeft.endTransmission() != 0) {
-        leftModules[i].present = false; changed = true;
+        leftModules[i].present = false; changed = true; failedLeft++;
         Serial.printf("[PING] L%d lost\n", i);
       }
     }
     if (rightModules[i].present) {
+      presentBeforeRight++;
       WireRight.beginTransmission(rightModules[i].address);
       if (WireRight.endTransmission() != 0) {
-        rightModules[i].present = false; changed = true;
-        Serial.printf("[PING] R%d lost\n", i);
+        rightModules[i].present = false; changed = true; failedRight++;
       }
     }
   }
+
+  // If EVERY previously-present module on one side failed in the same tick, that's a
+  // much stronger signal of a stuck bus (SDA held low) than of someone unplugging
+  // several modules at the exact same instant. Bug fix: recoverI2CBus() already existed
+  // for exactly this case but nothing ever called it — a real lockup would previously
+  // just look like "all modules disconnected" forever, with no self-healing.
+  if (presentBeforeLeft > 0 && failedLeft == presentBeforeLeft) {
+    Serial.println("[I2C] Left side looks locked up, attempting recovery");
+    recoverI2CBus(WireLeft, SDA_LEFT, SCL_LEFT);
+    busRecoveriesLeft++;
+    assignAddresses(ADDR_LEFT, WireLeft, SDA_LEFT, SCL_LEFT, leftModules);
+  } else if (failedLeft == 0) {
+    lastHeartbeatOkLeft = millis();
+  }
+
+  if (presentBeforeRight > 0 && failedRight == presentBeforeRight) {
+    Serial.println("[I2C] Right side looks locked up, attempting recovery");
+    recoverI2CBus(WireRight, SDA_RIGHT, SCL_RIGHT);
+    busRecoveriesRight++;
+    assignAddresses(ADDR_RIGHT, WireRight, SDA_RIGHT, SCL_RIGHT, rightModules);
+  } else if (failedRight == 0) {
+    lastHeartbeatOkRight = millis();
+  }
+
   if (changed) displayDirty = true;
+}
+
+int countPresent(Module *mods) {
+  int n = 0;
+  for (int i = 0; i < 3; i++) if (mods[i].present) n++;
+  return n;
 }
 
 void pollModuleData(TwoWire &bus, Module *mods) {
@@ -1059,11 +1100,8 @@ void drawAbout() {
   char r0[17]; sprintf(r0, "CLIQMOD v%-7s", FW_VERSION);
   lcdPrint(r0, 16);
   lcd.setCursor(0, 1);
-  int lMods = 0, rMods = 0;
-  for (int i = 0; i < 3; i++) {
-    if (leftModules[i].present)  lMods++;
-    if (rightModules[i].present) rMods++;
-  }
+  int lMods = countPresent(leftModules);
+  int rMods = countPresent(rightModules);
   char r1[17]; sprintf(r1, "L:%d R:%d Prof:%d  ", lMods, rMods, profileCount);
   lcdPrint(r1, 16);
 }
@@ -1231,6 +1269,19 @@ String buildStateJson() {
   JsonArray modArr = doc.createNestedArray("modules");
   writeModuleJson(modArr, leftModules,  "L");
   writeModuleJson(modArr, rightModules, "R");
+
+  JsonObject diag = doc.createNestedObject("diagnostics");
+  diag["uptimeMs"] = millis();
+  JsonObject diagL = diag.createNestedObject("left");
+  diagL["busRecoveries"]      = busRecoveriesLeft;
+  diagL["lastHeartbeatAgoMs"] = millis() - lastHeartbeatOkLeft;
+  diagL["modulesConnected"]   = countPresent(leftModules);
+  diagL["powerBudgetMax"]     = POWER_BUDGET_MAX_PER_SIDE;
+  JsonObject diagR = diag.createNestedObject("right");
+  diagR["busRecoveries"]      = busRecoveriesRight;
+  diagR["lastHeartbeatAgoMs"] = millis() - lastHeartbeatOkRight;
+  diagR["modulesConnected"]   = countPresent(rightModules);
+  diagR["powerBudgetMax"]     = POWER_BUDGET_MAX_PER_SIDE;
 
   String out; serializeJson(doc, out); return out;
 }
@@ -1743,6 +1794,55 @@ void setupWebServer() {
 
   server.on("/api/sources", HTTP_GET, []() {
     server.send(200, "application/json", buildSourcesJson());
+  });
+
+  // Fires an action immediately, bypassing the source-matching in fireMappingForSource()
+  // entirely — that function is designed for physical module interrupts, not for "the app
+  // says do this now". Two forms: {mappingId} re-fires an existing stored mapping by its
+  // stable id (also useful as a manual test button for any mapping, physical or not);
+  // {keycombo, isString} fires a one-off action that was never saved anywhere — this is
+  // what lets the app chain several quick triggers into a "macro" (e.g. Cmd+Space, then
+  // typed text, then Enter) purely as a sequence of ordinary API calls, no firmware-side
+  // macro/sequence support needed.
+  server.on("/api/trigger", HTTP_POST, []() {
+    if (!server.hasArg("plain")) { server.send(400); return; }
+    DynamicJsonDocument doc(512);
+    if (deserializeJson(doc, server.arg("plain"))) { server.send(400); return; }
+
+    if (doc.containsKey("mappingId")) {
+      int mid = doc["mappingId"];
+      if (mid < 0 || mid >= MAX_MAPPINGS || !profiles[activeProfile].mappings[mid].active) {
+        server.send(404, "application/json", "{\"ok\":false,\"error\":\"mapping not found\"}");
+        return;
+      }
+      Mapping &m = profiles[activeProfile].mappings[mid];
+      executeAction(m.action);
+      lastEventLabel = String(m.label);
+      lastEventTime  = millis();
+      displayDirty   = true;
+      server.send(200, "application/json", "{\"ok\":true}");
+      return;
+    }
+
+    if (!doc.containsKey("keycombo")) {
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"mappingId or keycombo required\"}");
+      return;
+    }
+
+    bool        isString  = doc["isString"]  | false;
+    const char *keycombo  = doc["keycombo"]  | "";
+    HIDAction   a;
+    if (isString) {
+      a.type = ACTION_STRING; a.modifier = 0; a.keycode = 0;
+      safeCopy(a.str, keycombo, sizeof(a.str));
+    } else {
+      a = parseKeyCombo(keycombo);
+    }
+    executeAction(a);
+    lastEventLabel = "App Trigger";
+    lastEventTime  = millis();
+    displayDirty   = true;
+    server.send(200, "application/json", "{\"ok\":true}");
   });
 
   // Called from the setup AP (or from STA mode, to switch networks). Attempts the join
