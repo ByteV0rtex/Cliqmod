@@ -110,9 +110,6 @@ struct DeckView: View {
 
     var body: some View {
         ZStack {
-            Theme.background.ignoresSafeArea()
-                .onTapGesture { toggleOverlay() }
-
             if let state = store.state {
                 let layout = store.layout(for: state.activeProfile)
                 GeometryReader { geo in
@@ -141,6 +138,10 @@ struct DeckView: View {
 
             overlayBar
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Theme.background.ignoresSafeArea())
+        .contentShape(Rectangle())
+        .onTapGesture { toggleOverlay() }
         .statusBarHidden(true)
         .onAppear {
             OrientationController.lockLandscape()
