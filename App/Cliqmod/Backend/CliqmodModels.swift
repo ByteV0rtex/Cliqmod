@@ -5,7 +5,6 @@
 //  Created by Doruk Arpali on 18.07.2026.
 //
 
-
 import Foundation
 
 // ============================================================
@@ -361,7 +360,7 @@ struct DeckLayout: Codable {
     var slots: [DeckSlot]
 
     static let presets: [(name: String, rows: Int, cols: Int)] = [
-        ("2x4", 2, 4), ("3x5", 3, 5), ("4x4", 4, 4), ("4x6", 4, 6)
+        ("2x4", 2, 4), ("2x5", 2, 5), ("3x5", 3, 5)
     ]
 
     static func makeDefault(rows: Int = 2, columns: Int = 4) -> DeckLayout {

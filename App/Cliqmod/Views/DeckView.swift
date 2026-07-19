@@ -5,7 +5,6 @@
 //  Created by Doruk Arpali on 18.07.2026.
 //
 
-
 import SwiftUI
 import UIKit
 
@@ -35,8 +34,6 @@ struct DeckButtonView: View {
     let isEditing: Bool
     let onTap: () -> Void
 
-    @State private var isPressed = false
-
     private var iconSize: CGFloat { min(max(cellSize * 0.32, 14), 34) }
     private var labelSize: CGFloat { min(max(cellSize * 0.11, 9), 13) }
     private var showsLabel: Bool { cellSize > 55 && !slot.label.isEmpty }
@@ -46,7 +43,6 @@ struct DeckButtonView: View {
             VStack(spacing: 6) {
                 Image(systemName: slot.action == .none ? "plus" : slot.symbol)
                     .font(.system(size: iconSize, weight: .medium))
-                    .symbolEffect(.bounce, value: isPressed)
                 if showsLabel {
                     Text(slot.label)
                         .font(.system(size: labelSize, weight: .semibold))
@@ -57,7 +53,7 @@ struct DeckButtonView: View {
             .foregroundStyle(slot.action == .none ? Color.secondary : Color.primary)
             .frame(width: cellSize, height: cellSize)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(DeckButtonPressStyle())
         .modifier(GlassButtonBackground(tint: slot.action == .none ? .gray : slot.tint.asTintColor))
         .overlay {
             if isEditing {
@@ -65,13 +61,21 @@ struct DeckButtonView: View {
                     .strokeBorder(.white.opacity(0.5), style: StrokeStyle(lineWidth: 1.5, dash: [5, 4]))
             }
         }
-        .scaleEffect(isPressed ? 0.94 : 1.0)
-        .animation(.spring(response: 0.25, dampingFraction: 0.6), value: isPressed)
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 0)
-                .onChanged { _ in isPressed = true }
-                .onEnded { _ in isPressed = false }
-        )
+    }
+}
+
+/// Press-scale feedback via the button's own isPressed state — no separate gesture
+/// recognizer needed. The previous version used .simultaneousGesture(DragGesture(...))
+/// for this, which (as its name says) opts the whole gesture system into *non-exclusive*
+/// recognition — that's what was letting taps leak through to the background's
+/// .onTapGesture (revealing the overlay on every button press) and making the button's
+/// own tap unreliable (several taps needed before it registered). A ButtonStyle gets
+/// press state for free, with no extra recognizer to conflict with anything.
+struct DeckButtonPressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.94 : 1.0)
+            .animation(.spring(response: 0.25, dampingFraction: 0.6), value: configuration.isPressed)
     }
 }
 
