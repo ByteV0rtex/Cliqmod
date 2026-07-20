@@ -52,6 +52,7 @@ struct DeckButtonView: View {
             }
             .foregroundStyle(slot.action == .none ? Color.secondary : Color.primary)
             .frame(width: cellSize, height: cellSize)
+            .contentShape(Rectangle())
         }
         .buttonStyle(DeckButtonPressStyle())
         .modifier(GlassButtonBackground(tint: slot.action == .none ? .gray : slot.tint.asTintColor))
