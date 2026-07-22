@@ -5,7 +5,6 @@
 //  Created by Doruk Arpali on 18.07.2026.
 //
 
-
 import SwiftUI
 
 struct RootView: View {
@@ -13,32 +12,19 @@ struct RootView: View {
 
     var body: some View {
         Group {
-            if let state = store.state {
-                if state.network.mode == "ap" {
-                    PairingView()
-                } else {
-                    switch store.currentTab {
-                    case .deck:
-                        DeckView()
-                    case .config:
-                        ConfigView()
-                    }
+            if let state = store.state, state.network.mode != "ap" {
+                switch store.currentTab {
+                case .deck:
+                    DeckView()
+                case .config:
+                    ConfigView()
                 }
-            } else if let error = store.lastError {
-                ContentUnavailableView {
-                    Label("Can't Reach Cliqmod", systemImage: "wifi.slash")
-                } description: {
-                    Text(error)
-                } actions: {
-                    Button("Retry") { Task { await store.refresh() } }
-                }
-                .background(Theme.background)
             } else {
-                ZStack {
-                    Theme.background.ignoresSafeArea()
-                    ProgressView("Connecting to Cliqmod...")
-                        .tint(Theme.accent)
-                }
+                // Not yet paired: store.state is either nil (haven't reached the brain
+                // yet) or present but still in AP/setup mode. PairingView's own steps
+                // handle both — the "still searching" UI is just what it shows for the
+                // nil case, no separate generic error screen needed.
+                PairingView()
             }
         }
         .environment(store)
