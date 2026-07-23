@@ -15,6 +15,7 @@
 		000000000000000000000120 /* Cliqmod.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Cliqmod.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		51136AFE300C14CD00D97291 /* OrientationController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OrientationController.swift; sourceTree = "<group>"; };
 		51136B00300C152100D97291 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
+		5132A189301212D200C52B17 /* Cliqmod-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "Cliqmod-Info.plist"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -42,6 +43,7 @@
 		000000000000000000000001 = {
 			isa = PBXGroup;
 			children = (
+				5132A189301212D200C52B17 /* Cliqmod-Info.plist */,
 				51136B00300C152100D97291 /* Theme.swift */,
 				51136AFE300C14CD00D97291 /* OrientationController.swift */,
 				51136AEB300B954800D97291 /* Backend */,
@@ -275,8 +277,10 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Cliqmod-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Cliqmod;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Cliqmod needs to acces your local network to connect to the brain.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -319,8 +323,10 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Cliqmod-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Cliqmod;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Cliqmod needs to acces your local network to connect to the brain.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;

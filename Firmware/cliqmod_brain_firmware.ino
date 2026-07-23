@@ -125,10 +125,18 @@
 static const uint8_t WIFI_OBFUSCATION_KEY[4] = {0x5A, 0xC3, 0x91, 0x2E};
 
 // ── HID action types ─────────────────────────────────────────
-#define ACTION_NONE   0
-#define ACTION_KEY    1   // single key
-#define ACTION_COMBO  2   // modifier + key  e.g. CTRL+Z
-#define ACTION_STRING 3   // type a string
+#define ACTION_NONE      0
+#define ACTION_KEY       1   // single key
+#define ACTION_COMBO     2   // modifier + key  e.g. CTRL+Z
+#define ACTION_STRING    3   // type a string
+#define ACTION_COMPANION 4   // send to Mac companion app over serial (open app / run
+                             // Shortcut / run AppleScript) instead of HID output
+
+// When type == ACTION_COMPANION, the `modifier` byte (otherwise CTRL/SHIFT/ALT/GUI
+// flags, meaningless here) is repurposed as the companion subtype:
+#define COMPANION_OPEN_APP         0
+#define COMPANION_RUN_SHORTCUT     1
+#define COMPANION_RUN_APPLESCRIPT  2
 
 // ── HID modifier flags (match USB HID spec) ──────────────────
 #define MOD_CTRL  0x01
@@ -179,7 +187,7 @@ struct HIDAction {
   uint8_t type;        // ACTION_*
   uint8_t modifier;    // MOD_* flags combined
   uint8_t keycode;     // raw HID keycode
-  char    str[20];     // for ACTION_STRING
+  char    str[64];     // for ACTION_STRING, or the companion payload for ACTION_COMPANION
 };
 
 // A mapping binds a source event to a HID action
@@ -249,6 +257,8 @@ bool          lcdNeedsClear     = false;
 
 // Heartbeat
 unsigned long lastHeartbeat = 0;
+unsigned long lastSerialHeartbeat = 0;
+#define SERIAL_HEARTBEAT_MS 2000
 
 // Menu
 enum Screen {
@@ -572,6 +582,55 @@ HIDAction parseKeyCombo(const char* combo) {
   return a;
 }
 
+// ============================================================
+//  MAC COMPANION SERIAL PROTOCOL — see SERIAL_PROTOCOL.md
+// ============================================================
+
+uint32_t companionRequestCounter = 0;
+
+String companionSubtypeToString(uint8_t s) {
+  switch (s) {
+    case COMPANION_OPEN_APP:        return "openApp";
+    case COMPANION_RUN_SHORTCUT:    return "runShortcut";
+    case COMPANION_RUN_APPLESCRIPT: return "runAppleScript";
+    default:                        return "unknown";
+  }
+}
+
+uint8_t companionSubtypeFromString(const String &s) {
+  if (s == "runShortcut")     return COMPANION_RUN_SHORTCUT;
+  if (s == "runAppleScript")  return COMPANION_RUN_APPLESCRIPT;
+  return COMPANION_OPEN_APP;
+}
+
+// Every protocol line shares this framing so the Mac app can tell a structured message
+// apart from the plain [WIFI]/[MACRO]/etc. debug logs sharing the same serial stream.
+void sendSerialProtocolLine(const String &json) {
+  Serial.print("CLIQ1|");
+  Serial.println(json);
+}
+
+void emitCompanionAction(HIDAction &action) {
+  companionRequestCounter++;
+  DynamicJsonDocument doc(256);
+  doc["type"]      = "companion_action";
+  doc["requestId"] = companionRequestCounter;
+  doc["subtype"]   = companionSubtypeToString(action.modifier);
+  doc["payload"]   = action.str;
+  String out; serializeJson(doc, out);
+  sendSerialProtocolLine(out);
+}
+
+void emitSerialHeartbeat() {
+  DynamicJsonDocument doc(192);
+  doc["type"]          = "heartbeat";
+  doc["firmware"]      = FW_VERSION;
+  doc["activeProfile"] = activeProfile;
+  doc["profileName"]   = profiles[activeProfile].name;
+  String out; serializeJson(doc, out);
+  sendSerialProtocolLine(out);
+}
+
 void executeAction(HIDAction &action) {
   switch (action.type) {
     case ACTION_NONE: break;
@@ -594,6 +653,12 @@ void executeAction(HIDAction &action) {
     }
     case ACTION_STRING:
       Keyboard.print(action.str);
+      break;
+    case ACTION_COMPANION:
+      // Not a HID action at all — handed off to the Mac companion app over serial.
+      // Works from both physical module events (via fireMappingForSource) and
+      // /api/trigger, since both funnel through this same function.
+      emitCompanionAction(action);
       break;
   }
 }
@@ -1148,8 +1213,9 @@ String modToString(uint8_t mod) {
 
 // Helper: HIDAction → keycombo string like "CTRL+Z"
 String actionToComboString(HIDAction &a) {
-  if (a.type == ACTION_STRING) return String(a.str);
-  if (a.type == ACTION_NONE)   return "";
+  if (a.type == ACTION_STRING)    return String(a.str);
+  if (a.type == ACTION_COMPANION) return String(a.str);
+  if (a.type == ACTION_NONE)      return "";
   String s = modToString(a.modifier);
   if (a.keycode >= 32 && a.keycode < 127) {
     if (s.length()) s += "+";
@@ -1262,7 +1328,10 @@ String buildStateJson() {
       mo["eventType"] = m.eventType;
       mo["eventTypeLabel"] = eventTypeToString(m.eventType);
       mo["keycombo"]  = actionToComboString(m.action);
-      mo["isString"]  = (m.action.type == ACTION_STRING);
+      mo["isString"]     = (m.action.type == ACTION_STRING);
+      mo["isCompanion"]  = (m.action.type == ACTION_COMPANION);
+      mo["companionSubtype"] = (m.action.type == ACTION_COMPANION)
+                                  ? companionSubtypeToString(m.action.modifier) : "";
     }
   }
 
@@ -1764,16 +1833,23 @@ void setupWebServer() {
       uint8_t     srcCode  = m["srcCode"]   | (uint8_t)SRC_BRAIN_ENC_CLICK;
       // Default to 0/0 so old clients that only ever sent brain sources still work —
       // brain mappings always use controlId=0, eventType=0.
-      uint8_t     controlId = m["controlId"] | 0;
-      uint8_t     eventType = m["eventType"] | 0;
-      bool        isString  = m["isString"]  | false;
+      uint8_t     controlId    = m["controlId"]    | 0;
+      uint8_t     eventType    = m["eventType"]    | 0;
+      bool        isString     = m["isString"]     | false;
+      bool        isCompanion  = m["isCompanion"]  | false;
+      const char *companionSub = m["companionSubtype"] | "";
 
       safeCopy(mp.label, label, sizeof(mp.label));
       mp.source    = srcCode;
       mp.controlId = controlId;
       mp.eventType = eventType;
 
-      if (isString) {
+      if (isCompanion) {
+        mp.action.type     = ACTION_COMPANION;
+        mp.action.modifier = companionSubtypeFromString(String(companionSub));
+        mp.action.keycode  = 0;
+        safeCopy(mp.action.str, keycombo, sizeof(mp.action.str));
+      } else if (isString) {
         mp.action.type     = ACTION_STRING;
         mp.action.modifier = 0;
         mp.action.keycode  = 0;
@@ -1829,10 +1905,15 @@ void setupWebServer() {
       return;
     }
 
-    bool        isString  = doc["isString"]  | false;
-    const char *keycombo  = doc["keycombo"]  | "";
+    bool        isString     = doc["isString"]     | false;
+    bool        isCompanion  = doc["isCompanion"]  | false;
+    const char *companionSub = doc["companionSubtype"] | "";
+    const char *keycombo     = doc["keycombo"]     | "";
     HIDAction   a;
-    if (isString) {
+    if (isCompanion) {
+      a.type = ACTION_COMPANION; a.modifier = companionSubtypeFromString(String(companionSub)); a.keycode = 0;
+      safeCopy(a.str, keycombo, sizeof(a.str));
+    } else if (isString) {
       a.type = ACTION_STRING; a.modifier = 0; a.keycode = 0;
       safeCopy(a.str, keycombo, sizeof(a.str));
     } else {
@@ -2003,10 +2084,17 @@ void loop() {
   if (intLeftFlag)  { intLeftFlag  = false; pollModuleData(WireLeft,  leftModules);  }
   if (intRightFlag) { intRightFlag = false; pollModuleData(WireRight, rightModules); }
 
-  // Heartbeat
+  // Heartbeat (module presence check — unrelated to the serial heartbeat below)
   if (millis() - lastHeartbeat > HEARTBEAT_MS) {
     lastHeartbeat = millis();
     pingModules();
+  }
+
+  // Serial heartbeat — the Mac companion app's only signal that a brain is on the
+  // other end of the USB serial line (see SERIAL_PROTOCOL.md)
+  if (millis() - lastSerialHeartbeat > SERIAL_HEARTBEAT_MS) {
+    lastSerialHeartbeat = millis();
+    emitSerialHeartbeat();
   }
 
   // Clear event label after timeout
