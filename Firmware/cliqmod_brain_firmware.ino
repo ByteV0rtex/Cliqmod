@@ -360,8 +360,19 @@ void initDefaultProfiles() {
   strncpy(profiles[0].mappings[2].label, "Save", 19);
 }
 
+// Bump this whenever the Profile / Mapping / HIDAction layout changes. NVS stores these
+// as raw struct bytes, so a layout change makes previously-saved data unreadable — the
+// mismatched getBytes() leaves the zero-initialized struct behind, which shows up as
+// every profile having a blank name. Validating a stored version means we detect that
+// and cleanly reset to defaults instead of loading garbage.
+//
+// v1 -> v2: HIDAction.str grew from 20 to 64 chars (companion action payloads).
+#define PROFILE_SCHEMA_VERSION 2
+
 void saveProfiles() {
   prefs.begin("cliqmod", false);
+  prefs.putInt("schema", PROFILE_SCHEMA_VERSION);
+  prefs.putInt("profSize", (int)sizeof(Profile));
   prefs.putInt("pCount", profileCount);
   prefs.putInt("pActive", activeProfile);
   for (int i = 0; i < profileCount; i++) {
@@ -374,20 +385,60 @@ void saveProfiles() {
 
 void loadProfiles() {
   prefs.begin("cliqmod", true);
-  int count = prefs.getInt("pCount", 0);
+
+  int storedSchema = prefs.getInt("schema", 0);
+  int storedSize   = prefs.getInt("profSize", 0);
+  int count        = prefs.getInt("pCount", 0);
+
+  // Nothing saved yet — first boot after a full flash erase.
   if (count == 0) {
     prefs.end();
     initDefaultProfiles();
     return;
   }
-  profileCount  = count;
-  activeProfile = prefs.getInt("pActive", 0);
+
+  // Saved data predates versioning (schema 0), is from an older schema, or was written
+  // when Profile had a different size. Any of those means the bytes on flash don't
+  // match the struct we'd read them into.
+  if (storedSchema != PROFILE_SCHEMA_VERSION || storedSize != (int)sizeof(Profile)) {
+    prefs.end();
+    Serial.printf("[NVS] Saved profiles are schema %d / %d bytes, firmware expects %d / %d - resetting to defaults\n",
+                  storedSchema, storedSize, PROFILE_SCHEMA_VERSION, (int)sizeof(Profile));
+    initDefaultProfiles();
+    saveProfiles();   // stamp the current schema so this only happens once
+    return;
+  }
+
+  profileCount = constrain(count, 0, MAX_PROFILES);
+  if (profileCount <= 0) {
+    prefs.end();
+    Serial.println("[NVS] Stored profile count invalid - resetting to defaults");
+    initDefaultProfiles();
+    saveProfiles();
+    return;
+  }
+  activeProfile = constrain(prefs.getInt("pActive", 0), 0, profileCount - 1);
+
   for (int i = 0; i < profileCount; i++) {
     char key[12]; sprintf(key, "p%d", i);
-    prefs.getBytes(key, &profiles[i], sizeof(Profile));
+    size_t read = prefs.getBytes(key, &profiles[i], sizeof(Profile));
+    if (read != sizeof(Profile)) {
+      // Individual profile blob is missing or the wrong length — don't leave a
+      // half-populated struct around, since that's what produced blank names.
+      prefs.end();
+      Serial.printf("[NVS] Profile %d read %u bytes, expected %u - resetting to defaults\n",
+                    i, (unsigned)read, (unsigned)sizeof(Profile));
+      initDefaultProfiles();
+      saveProfiles();
+      return;
+    }
+    // Defensive: guarantee the name is terminated even if flash content is corrupt,
+    // since every LCD/JSON read of it assumes a valid C string.
+    profiles[i].name[sizeof(profiles[i].name) - 1] = '\0';
   }
+
   prefs.end();
-  Serial.printf("[NVS] Loaded %d profiles\n", profileCount);
+  Serial.printf("[NVS] Loaded %d profiles (schema %d)\n", profileCount, storedSchema);
 }
 
 // ============================================================
@@ -458,7 +509,7 @@ void startAPMode() {
   isAPMode      = true;
   wifiConnected = false;
   currentSTASSID = "";
-  Serial.printf("[WIFI] AP mode — SSID '%s', IP %s\n",
+  Serial.printf("[WIFI] AP mode - SSID '%s', IP %s\n",
                 AP_SSID, WiFi.softAPIP().toString().c_str());
 }
 
@@ -478,11 +529,11 @@ bool tryConnectSTA(const String &ssid, const String &pass, unsigned long timeout
     wifiConnected  = true;
     currentSTASSID = ssid;
     lastWifiError  = "";
-    Serial.printf("[WIFI] Connected — IP %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[WIFI] Connected - IP %s\n", WiFi.localIP().toString().c_str());
 
     if (MDNS.begin(MDNS_HOSTNAME)) {
       MDNS.addService("http", "tcp", 80);
-      Serial.printf("[WIFI] mDNS up — http://%s.local\n", MDNS_HOSTNAME);
+      Serial.printf("[WIFI] mDNS up - http://%s.local\n", MDNS_HOSTNAME);
     } else {
       Serial.println("[WIFI] mDNS failed to start (non-fatal)");
     }
@@ -2028,7 +2079,7 @@ void setupWebServer() {
   });
 
   server.begin();
-  Serial.println("[WEB] Started — 192.168.4.1");
+  Serial.println("[WEB] Started - 192.168.4.1");
 }
 
 // ============================================================
@@ -2036,9 +2087,30 @@ void setupWebServer() {
 // ============================================================
 
 void setup() {
+  // ORDER MATTERS, and it is not obvious:
+  //   Serial.begin()   registers the CDC interface with TinyUSB
+  //   Keyboard.begin() registers the HID interface with TinyUSB
+  //   USB.begin()      starts the stack and enumerates the composite device using
+  //                    whatever interfaces were registered BEFORE this point
+  // Calling USB.begin() first enumerates a device missing those interfaces, which
+  // shows up on the host as a garbage/undecodable serial stream.
   Serial.begin(115200);
-  delay(300);
+  Keyboard.begin();
+  USB.begin();
+
+  // Separately: in USB-OTG mode `Serial` is a USB CDC endpoint, so anything printed
+  // before enumeration completes goes nowhere. Wait (bounded, so a headless boot on a
+  // charger doesn't hang) before logging, otherwise the boot banner is silently lost.
+  unsigned long usbWaitStart = millis();
+  while (!Serial && (millis() - usbWaitStart) < 1500) delay(10);
+
+  // Bounds how long a Serial write can stall when no host is draining the buffer; the
+  // stock 100ms is enough to hitch the main loop. Do NOT use 0 — that makes writes
+  // non-blocking and silently DISCARDS anything not immediately sendable.
+  Serial.setTxTimeoutMs(10);
+
   Serial.println("\n[CLIQMOD] v" FW_VERSION " booting");
+  Serial.println("[HID] Ready");
 
   // Pins
   pinMode(ENC_CLK,   INPUT_PULLUP);
@@ -2054,10 +2126,8 @@ void setup() {
   attachInterrupt(INT_LEFT,  onIntLeft,  FALLING);
   attachInterrupt(INT_RIGHT, onIntRight, FALLING);
 
-  // USB HID
-  Keyboard.begin();
-  USB.begin();
-  Serial.println("[HID] Ready");
+  // (USB HID is initialised at the very top of setup() — it has to happen before any
+  // Serial output, since Serial is itself a USB CDC endpoint in USB-OTG mode.)
 
   // LCD
   Wire.begin(SDA_LCD, SCL_LCD);
