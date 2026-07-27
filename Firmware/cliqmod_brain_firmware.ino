@@ -539,20 +539,43 @@ HIDAction parseKeyCombo(const char* combo) {
   char *lastToken = nullptr;
 
   while (token != nullptr) {
-    if      (strcmp(token, "CTRL")  == 0) mod |= MOD_CTRL;
-    else if (strcmp(token, "SHIFT") == 0) mod |= MOD_SHIFT;
-    else if (strcmp(token, "ALT")   == 0) mod |= MOD_ALT;
-    else if (strcmp(token, "GUI")   == 0) mod |= MOD_GUI;
-    else if (strcmp(token, "WIN")   == 0) mod |= MOD_GUI;
-    else lastToken = token;
+    if      (strcmp(token, "CTRL")    == 0) mod |= MOD_CTRL;
+    else if (strcmp(token, "CONTROL") == 0) mod |= MOD_CTRL;
+    else if (strcmp(token, "SHIFT")   == 0) mod |= MOD_SHIFT;
+    else if (strcmp(token, "ALT")     == 0) mod |= MOD_ALT;
+    else if (strcmp(token, "OPT")     == 0) mod |= MOD_ALT;   // macOS name for ALT
+    else if (strcmp(token, "OPTION")  == 0) mod |= MOD_ALT;
+    else if (strcmp(token, "GUI")     == 0) mod |= MOD_GUI;
+    else if (strcmp(token, "WIN")     == 0) mod |= MOD_GUI;
+    else if (strcmp(token, "WINDOWS") == 0) mod |= MOD_GUI;
+    // Bug fix: CMD/COMMAND/META were missing entirely, so "CMD+C" treated CMD as the
+    // key, then C overwrote it — the modifier was silently dropped and you got a bare
+    // "c". Every Mac shortcut was broken by this.
+    else if (strcmp(token, "CMD")     == 0) mod |= MOD_GUI;
+    else if (strcmp(token, "COMMAND") == 0) mod |= MOD_GUI;
+    else if (strcmp(token, "META")    == 0) mod |= MOD_GUI;
+    // Only the FIRST non-modifier token counts as the key. Previously a later token
+    // silently overwrote an earlier one, so a typo'd modifier ("CTLR+C") quietly
+    // became a plain "c" press instead of failing visibly.
+    else if (lastToken == nullptr) lastToken = token;
     token = strtok(nullptr, "+");
   }
 
-  if (lastToken == nullptr) return a;
-
   a.modifier = mod;
 
-  // Single character key
+  // Modifier-only action, e.g. "GUI" on its own to open the Windows Start menu.
+  // Bug fix: this previously returned ACTION_NONE and did nothing at all, which is
+  // why the Windows "Open App" macro silently failed.
+  if (lastToken == nullptr) {
+    if (mod == 0) return a;              // nothing usable in the string at all
+    a.type    = ACTION_COMBO;
+    a.keycode = 0;                       // executeAction() treats 0 as "modifiers only"
+    return a;
+  }
+
+  // Single character key. NOTE: only ASCII works here — see the comment on
+  // ACTION_STRING in executeAction() for why non-ASCII (ü, ç, ş...) can't be sent
+  // over plain HID.
   if (strlen(lastToken) == 1) {
     a.type    = (mod > 0) ? ACTION_COMBO : ACTION_KEY;
     a.keycode = tolower(lastToken[0]);
@@ -562,6 +585,7 @@ HIDAction parseKeyCombo(const char* combo) {
   // Special keys
   if      (strcmp(lastToken, "SPACE")  == 0) { a.type = ACTION_KEY; a.keycode = ' '; }
   else if (strcmp(lastToken, "ENTER")  == 0) { a.type = ACTION_KEY; a.keycode = KEY_RETURN; }
+  else if (strcmp(lastToken, "RETURN") == 0) { a.type = ACTION_KEY; a.keycode = KEY_RETURN; }
   else if (strcmp(lastToken, "ESC")    == 0) { a.type = ACTION_KEY; a.keycode = KEY_ESC; }
   else if (strcmp(lastToken, "TAB")    == 0) { a.type = ACTION_KEY; a.keycode = KEY_TAB; }
   else if (strcmp(lastToken, "DELETE") == 0) { a.type = ACTION_KEY; a.keycode = KEY_DELETE; }
@@ -646,12 +670,28 @@ void executeAction(HIDAction &action) {
       if (action.modifier & MOD_ALT)   Keyboard.press(KEY_LEFT_ALT);
       if (action.modifier & MOD_GUI)   Keyboard.press(KEY_LEFT_GUI);
       delay(5);
-      Keyboard.press(action.keycode);
-      delay(15);
+      // keycode 0 means "modifiers only" (e.g. tapping GUI alone to open the Start
+      // menu / Spotlight) — pressing keycode 0 would send a meaningless null keypress.
+      if (action.keycode != 0) {
+        Keyboard.press(action.keycode);
+        delay(15);
+      } else {
+        delay(15);
+      }
       Keyboard.releaseAll();
       break;
     }
     case ACTION_STRING:
+      // LIMITATION — non-ASCII does not work here, and this is inherent to USB HID
+      // rather than a bug we can patch: HID transmits *keycodes* (physical key
+      // positions), not characters. The host OS decides which character each keycode
+      // produces, using whatever keyboard layout is currently selected. So:
+      //   - Characters with no key on a US layout (ü, ç, ş, ğ, ı, ö) cannot be sent.
+      //   - Even ASCII punctuation can come out wrong if the host is set to a non-US
+      //     layout (a Turkish Q layout will produce different characters for several
+      //     keys than this US-layout keymap assumes).
+      // The real fix for arbitrary Unicode is ACTION_COMPANION with the Mac companion
+      // app, which can inject text directly as Unicode regardless of layout.
       Keyboard.print(action.str);
       break;
     case ACTION_COMPANION:
@@ -1341,6 +1381,13 @@ String buildStateJson() {
 
   JsonObject diag = doc.createNestedObject("diagnostics");
   diag["uptimeMs"] = millis();
+  // Heap stats: each API request allocates a large transient JSON buffer, so repeated
+  // alloc/free can fragment the heap over time. A healthy freeHeap alongside a
+  // shrinking largestFreeBlock is the tell-tale signature of fragmentation, which
+  // shows up as requests intermittently failing rather than failing consistently.
+  diag["freeHeap"]        = ESP.getFreeHeap();
+  diag["minFreeHeap"]     = ESP.getMinFreeHeap();
+  diag["largestFreeBlock"] = ESP.getMaxAllocHeap();
   JsonObject diagL = diag.createNestedObject("left");
   diagL["busRecoveries"]      = busRecoveriesLeft;
   diagL["lastHeartbeatAgoMs"] = millis() - lastHeartbeatOkLeft;

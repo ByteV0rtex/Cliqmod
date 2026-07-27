@@ -28,6 +28,10 @@ struct Diagnostics: Codable {
     let uptimeMs: Int
     let left: SideDiagnostics
     let right: SideDiagnostics
+    // Optional so a brain running firmware from before these were added still decodes.
+    let freeHeap: Int?
+    let minFreeHeap: Int?
+    let largestFreeBlock: Int?
 }
 
 struct SideDiagnostics: Codable {

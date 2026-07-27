@@ -93,18 +93,34 @@ final class CliqmodStore {
     /// succeeded, so refresh() can decide whether to try the other candidate address.
     private func tryFetch() async -> Bool {
         do {
-            async let stateResult = client.fetchState()
-            async let sourcesResult = client.fetchSources()
-            let (newState, newSources) = try await (stateResult, sourcesResult)
+            // Deliberately sequential, NOT `async let` in parallel. The ESP32's
+            // WebServer library services exactly one client per handleClient() call in
+            // the firmware's main loop — firing two requests simultaneously means the
+            // second one is stalled or dropped depending on timing, which showed up as
+            // the connection working intermittently rather than failing outright.
+            let newState = try await client.fetchState()
             state = newState
-            sources = newSources
             lastError = nil
             ensureLayoutExists(for: newState.activeProfile)
+
+            // Sources only change when modules are physically connected/disconnected,
+            // so there's no reason to re-fetch them every poll cycle — that was
+            // doubling the request load on a server that can only handle one at a time.
+            // rescanModules() refreshes them explicitly when it actually matters.
+            if sources.isEmpty {
+                sources = (try? await client.fetchSources()) ?? []
+            }
             return true
         } catch {
             lastError = "Can't reach Cliqmod — \(error.localizedDescription)"
             return false
         }
+    }
+
+    /// Forces a sources re-fetch — call after anything that changes which modules are
+    /// connected, since tryFetch() otherwise leaves an already-populated list alone.
+    private func refreshSources() async {
+        sources = (try? await client.fetchSources()) ?? sources
     }
 
     // MARK: - Actions
@@ -141,6 +157,9 @@ final class CliqmodStore {
         do {
             try await client.rescan()
             await refresh()
+            // Module set just changed, so the mappable-source list almost certainly did
+            // too — tryFetch() won't re-pull it on its own once it's non-empty.
+            await refreshSources()
         } catch {
             lastError = "Rescan failed: \(error.localizedDescription)"
         }

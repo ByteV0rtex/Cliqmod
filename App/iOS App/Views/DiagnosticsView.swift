@@ -34,7 +34,34 @@ struct DiagnosticsView: View {
             LabeledContent("Firmware", value: "v\(state.firmware)")
             LabeledContent("Uptime", value: formatDuration(ms: state.diagnostics.uptimeMs))
             LabeledContent("Active Profile", value: state.profiles[state.activeProfile].name)
+
+            if let freeHeap = state.diagnostics.freeHeap {
+                LabeledContent("Free Memory", value: formatBytes(freeHeap))
+            }
+            if let minFree = state.diagnostics.minFreeHeap {
+                LabeledContent("Lowest Ever", value: formatBytes(minFree))
+            }
+            if let largest = state.diagnostics.largestFreeBlock,
+               let freeHeap = state.diagnostics.freeHeap {
+                // A largest-contiguous-block much smaller than total free memory means
+                // the heap is fragmented — the signature of requests that fail
+                // intermittently rather than consistently.
+                let fragmented = freeHeap > 0 && Double(largest) / Double(freeHeap) < 0.5
+                LabeledContent("Largest Block") {
+                    HStack(spacing: 4) {
+                        if fragmented {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(Color.orange)
+                        }
+                        Text(formatBytes(largest))
+                    }
+                }
+            }
         }
+    }
+
+    private func formatBytes(_ bytes: Int) -> String {
+        bytes >= 1024 ? String(format: "%.1f KB", Double(bytes) / 1024) : "\(bytes) B"
     }
 
     private func networkSection(state: CliqmodState) -> some View {

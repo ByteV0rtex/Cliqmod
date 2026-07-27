@@ -75,7 +75,16 @@ API responses.
 
 `HIDAction.str` was bumped from 20 to 64 characters to comfortably fit app/shortcut
 names and short one-line AppleScript commands — full multi-line scripts still won't fit
-and aren't a v1 goal. This does change the `Mapping` struct's in-memory/on-flash size,
-so a freshly flashed device starts with default profiles rather than trying to migrate
-old saved data — a non-issue right now since nothing's been deployed to real hardware
-yet.
+and aren't a v1 goal.
+
+**This changed the `Mapping`/`Profile` struct size, which broke previously-saved
+profiles.** NVS stores these as raw struct bytes, so a device that already had profiles
+saved under the old layout couldn't read them back — `getBytes()` failed against the
+mismatched size and left the zero-initialized struct in place, which surfaced as every
+profile having a blank name.
+
+The firmware now stamps `PROFILE_SCHEMA_VERSION` (and the actual `sizeof(Profile)`) into
+NVS alongside the data, validates both on load, and falls back to defaults on any
+mismatch. **Bump `PROFILE_SCHEMA_VERSION` whenever the `Profile`, `Mapping`, or
+`HIDAction` layout changes** — that's what makes the reset automatic rather than a
+silent corruption.
