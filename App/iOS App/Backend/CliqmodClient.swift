@@ -5,21 +5,29 @@
 //  Created by Doruk Arpali on 18.07.2026.
 //
 
-
 import Foundation
 
 /// Wraps every call to the brain's REST API. One actor so requests are naturally
 /// serialized — matters here because the brain is a single-threaded ESP32 web server,
 /// not a beefy backend that shrugs off concurrent requests.
 ///
-/// Point `baseURL` at `http://localhost:8080` for the mock server, or
-/// `http://cliqmod.local` / the brain's IP once you're on real hardware — nothing else
-/// in the app needs to change.
+/// Point `baseURL` at `http://192.168.4.1` (the brain's own setup-AP address) or
+/// `http://cliqmod.local` once it's joined your home WiFi — that's the default now that
+/// testing has moved to real hardware. Switch back to `http://localhost:8080` only when
+/// running against mock-server.js in the simulator.
 actor CliqmodClient {
-    var baseURL: URL
+    private(set) var baseURL: URL
 
-    init(baseURL: URL = URL(string: "http://localhost:8080")!) {
+    init(baseURL: URL = URL(string: "http://192.168.4.1")!) {
         self.baseURL = baseURL
+    }
+
+    /// Called when the brain's reachable address changes — e.g. after a successful
+    /// WiFi join, it restarts and moves from its own fixed AP address to whatever IP
+    /// DHCP assigns it on the home network. Needs to be a method rather than a plain
+    /// external assignment since baseURL is actor-isolated state.
+    func updateBaseURL(_ newURL: URL) {
+        baseURL = newURL
     }
 
     enum ClientError: Error {

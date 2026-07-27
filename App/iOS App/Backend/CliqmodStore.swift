@@ -5,7 +5,6 @@
 //  Created by Doruk Arpali on 18.07.2026.
 //
 
-
 import Foundation
 import Observation
 
@@ -33,9 +32,17 @@ final class CliqmodStore {
     private var pollTask: Task<Void, Never>?
     private let defaults = UserDefaults.standard
     private static let layoutsKey = "cliqmod.deckLayouts"
+    private static let lastWorkingHostKey = "cliqmod.lastWorkingHost"
 
-    init(baseURL: URL = URL(string: "http://localhost:8080")!) {
-        self.client = CliqmodClient(baseURL: baseURL)
+    /// The brain is reachable at a different address depending on its mode: its own
+    /// fixed IP while broadcasting the setup AP, or cliqmod.local via mDNS once it's
+    /// joined a home network. Both are tried on every failed refresh — see refresh().
+    private static let candidateHosts = ["http://192.168.4.1", "http://cliqmod.local"]
+
+    init() {
+        let savedHost = UserDefaults.standard.string(forKey: Self.lastWorkingHostKey)
+        let startingHost = savedHost ?? Self.candidateHosts[0]
+        self.client = CliqmodClient(baseURL: URL(string: startingHost)!)
         loadLayoutsFromDisk()
     }
 
@@ -59,6 +66,32 @@ final class CliqmodStore {
     func refresh() async {
         isLoading = true
         defer { isLoading = false }
+
+        if await tryFetch() {
+            defaults.set(await client.baseURL.absoluteString, forKey: Self.lastWorkingHostKey)
+            return
+        }
+
+        // Current address failed — the brain's reachable address changes between AP
+        // mode (setup) and STA mode (joined a home network), so a single fixed
+        // baseURL can't work forever. Try whichever candidate we're NOT currently
+        // using before giving up for this cycle.
+        let currentHost = await client.baseURL.absoluteString
+        for candidate in Self.candidateHosts where candidate != currentHost {
+            guard let url = URL(string: candidate) else { continue }
+            await client.updateBaseURL(url)
+            if await tryFetch() {
+                defaults.set(candidate, forKey: Self.lastWorkingHostKey)
+                return
+            }
+        }
+        // Both candidates failed this cycle — lastError already set by the final
+        // tryFetch() attempt. Next poll tick tries again from wherever we ended up.
+    }
+
+    /// Single attempt against whatever client.baseURL currently is. Returns whether it
+    /// succeeded, so refresh() can decide whether to try the other candidate address.
+    private func tryFetch() async -> Bool {
         do {
             async let stateResult = client.fetchState()
             async let sourcesResult = client.fetchSources()
@@ -67,8 +100,10 @@ final class CliqmodStore {
             sources = newSources
             lastError = nil
             ensureLayoutExists(for: newState.activeProfile)
+            return true
         } catch {
             lastError = "Can't reach Cliqmod — \(error.localizedDescription)"
+            return false
         }
     }
 

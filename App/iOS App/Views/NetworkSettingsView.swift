@@ -68,11 +68,18 @@ struct WifiJoinFormView: View {
         defer { isJoining = false }
         do {
             let result = try await store.client.joinWifi(ssid: ssid, password: password)
-            if !result.ok {
+            if result.ok {
+                // The brain restarts itself and stops broadcasting its own setup AP
+                // entirely once it's joined a home network — its reachable address
+                // changes from its fixed AP IP to cliqmod.local (mDNS). Switching now
+                // means the next poll tick tries the right address immediately instead
+                // of first wasting a cycle on the now-dead AP address.
+                if let mdnsURL = URL(string: "http://cliqmod.local") {
+                    await store.client.updateBaseURL(mdnsURL)
+                }
+            } else {
                 errorMessage = result.error ?? "Could not connect"
             }
-            // On success the brain restarts itself; polling will just start succeeding
-            // again once it comes back up on the new network — nothing else to do here.
         } catch {
             errorMessage = "Request failed — still on the Cliqmod setup WiFi?"
         }
@@ -123,7 +130,7 @@ private struct WelcomeStepView: View {
                         .scaleEffect(pulse ? 1.15 : 0.9)
                         .opacity(pulse ? 0.9 : 0.5)
 
-                    Image(systemName: "square.grid.3x3.square")
+                    Image(systemName: "keyboard.badge.ellipsis")
                         .font(.system(size: 64, weight: .medium))
                         .foregroundStyle(Theme.accent)
                 }
@@ -137,7 +144,7 @@ private struct WelcomeStepView: View {
                     Text("Welcome to Cliqmod")
                         .font(.largeTitle.bold())
                     // Easy to swap — just change this one line.
-                    Text("Your desk, reprogrammed.")
+                    Text("Every shortcut, right where you need it.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -299,7 +306,14 @@ struct NetworkSettingsView: View {
                     }
                     Section {
                         Button("Forget This Network", role: .destructive) {
-                            Task { try? await store.client.forgetWifi() }
+                            Task {
+                                try? await store.client.forgetWifi()
+                                // Brain restarts back into its own setup AP with a fixed
+                                // IP — same reasoning as the join-success switch above.
+                                if let apURL = URL(string: "http://192.168.4.1") {
+                                    await store.client.updateBaseURL(apURL)
+                                }
+                            }
                         }
                     }
                 } else {
