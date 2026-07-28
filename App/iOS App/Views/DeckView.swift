@@ -138,6 +138,7 @@ struct DeckView: View {
             }
 
             overlayBar
+            connectionBanner
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Theme.background.ignoresSafeArea())
@@ -189,10 +190,54 @@ struct DeckView: View {
                 if isEditing {
                     editingSlot = slot
                 } else {
-                    Task { await store.fire(slot.action) }
+                    Task { await fireSlot(slot) }
                 }
             }
         }
+    }
+
+    /// Always visible when the connection isn't healthy — deliberately NOT inside the
+    /// tap-to-reveal overlay, since the entire problem being solved is that a dead
+    /// connection was invisible unless you went digging in Config.
+    @ViewBuilder
+    private var connectionBanner: some View {
+        if !store.connectionState.isHealthy {
+            VStack {
+                Spacer()
+                HStack(spacing: 8) {
+                    Image(systemName: store.connectionState == .disconnected
+                          ? "wifi.slash" : "arrow.triangle.2.circlepath")
+                        .font(.caption)
+                    Text(store.connectionState.label)
+                        .font(.caption.weight(.semibold))
+                    if store.connectionState == .disconnected {
+                        Button("Retry") {
+                            Task { await store.refresh() }
+                        }
+                        .font(.caption.weight(.bold))
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Theme.accent)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 9)
+                .background(
+                    Capsule().fill(store.connectionState == .disconnected
+                                    ? Color.red.opacity(0.85) : Color.orange.opacity(0.8))
+                )
+                .padding(.bottom, 16)
+            }
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+            .animation(.easeOut(duration: 0.25), value: store.connectionState)
+        }
+    }
+
+    private func fireSlot(_ slot: DeckSlot) async {
+        let ok = await store.fire(slot.action)
+        // In Deck mode you're looking at the button you pressed, not at a status area,
+        // so a haptic is the fastest way to convey "that didn't actually go anywhere".
+        let generator = UINotificationFeedbackGenerator()
+        generator.notificationOccurred(ok ? .success : .error)
     }
 
     private func saveSlot(_ slot: DeckSlot, profileIndex: Int) {

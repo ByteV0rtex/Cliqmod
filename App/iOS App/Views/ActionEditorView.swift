@@ -5,7 +5,6 @@
 //  Created by Doruk Arpali on 18.07.2026.
 //
 
-
 import SwiftUI
 
 private enum ActionKind: String, CaseIterable, Identifiable {
@@ -14,7 +13,8 @@ private enum ActionKind: String, CaseIterable, Identifiable {
     case keyCombo = "Key Combo"
     case typeText = "Type Text"
     case macro = "Macro"
-    case openApp = "Open App"
+    case companion = "Mac App Action"
+    case openApp = "Open App (keystroke fallback)"
     case switchProfile = "Switch Profile"
     var id: String { rawValue }
 }
@@ -39,6 +39,8 @@ struct ActionEditorView: View {
     @State private var macroSteps: [MacroStep] = []
     @State private var openAppName = ""
     @State private var openAppTarget: TargetOS = .mac
+    @State private var companionSubtype: CompanionSubtype = .openApp
+    @State private var companionPayload = ""
     @State private var switchProfileIndex = 0
 
     private static let symbolChoices = [
@@ -76,6 +78,10 @@ struct ActionEditorView: View {
             _kind = State(initialValue: .openApp)
             _openAppName = State(initialValue: name)
             _openAppTarget = State(initialValue: target)
+        case .companion(let subtype, let payload):
+            _kind = State(initialValue: .companion)
+            _companionSubtype = State(initialValue: subtype)
+            _companionPayload = State(initialValue: payload)
         case .switchProfile(let index):
             _kind = State(initialValue: .switchProfile)
             _switchProfileIndex = State(initialValue: index)
@@ -197,6 +203,22 @@ struct ActionEditorView: View {
                     .font(.caption).foregroundStyle(.secondary)
                 Text("This is a blind, timed sequence — there's no confirmation the app actually opened. Works well for apps that show up as the first Spotlight/Search result; less reliable on a slow or busy system.")
                     .font(.caption).foregroundStyle(.orange)
+                if openAppTarget == .mac {
+                    Text("On Mac, prefer \"Mac App Action\" instead — it launches the app directly and doesn't depend on Spotlight timing.")
+                        .font(.caption).foregroundStyle(Theme.accent)
+                }
+            }
+
+        case .companion:
+            Section("Mac App Action") {
+                Picker("Type", selection: $companionSubtype) {
+                    ForEach(CompanionSubtype.allCases) { Text($0.displayName).tag($0) }
+                }
+                TextField(companionSubtype.placeholder, text: $companionPayload, axis: .vertical)
+                Text(companionSubtype.helpText)
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("Requires the Cliqmod companion app running on the Mac, connected over USB. These do nothing on Windows.")
+                    .font(.caption).foregroundStyle(.orange)
             }
 
         case .switchProfile:
@@ -280,6 +302,8 @@ struct ActionEditorView: View {
             action = .macro(macroSteps)
         case .openApp:
             action = .openApp(name: openAppName, target: openAppTarget)
+        case .companion:
+            action = .companion(subtype: companionSubtype, payload: companionPayload)
         case .switchProfile:
             action = .switchProfile(index: switchProfileIndex)
         }

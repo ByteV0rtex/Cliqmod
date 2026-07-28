@@ -65,8 +65,11 @@ struct Mapping: Codable, Identifiable {
     var controlId: Int
     var eventType: Int
     let eventTypeLabel: String  // "enc_cw", "enc_ccw", "fader", "button", "none", etc.
-    var keycombo: String        // key combo string OR literal text, depending on isString
+    var keycombo: String        // key combo string, literal text, or companion payload
     var isString: Bool
+    // Optional so a brain running firmware from before companion actions still decodes.
+    var isCompanion: Bool?
+    var companionSubtype: String?
 }
 
 struct ModuleInfo: Codable, Identifiable {
@@ -118,11 +121,13 @@ struct SaveMappingsRequest: Codable {
 // incremental "edit one mapping" endpoint.
 struct MappingPayload: Codable {
     let label: String
-    let keycombo: String
+    let keycombo: String     // doubles as the companion payload when isCompanion is true
     let srcCode: Int
     let controlId: Int
     let eventType: Int
     let isString: Bool
+    var isCompanion: Bool = false
+    var companionSubtype: String = ""
 }
 
 struct WifiJoinRequest: Codable {
@@ -150,12 +155,20 @@ struct TriggerRequest: Codable {
     var mappingId: Int?
     var keycombo: String?
     var isString: Bool?
+    var isCompanion: Bool?
+    var companionSubtype: String?
 
     static func mapping(_ id: Int) -> TriggerRequest {
         TriggerRequest(mappingId: id, keycombo: nil, isString: nil)
     }
     static func adHoc(keycombo: String, isString: Bool = false) -> TriggerRequest {
         TriggerRequest(mappingId: nil, keycombo: keycombo, isString: isString)
+    }
+    /// Fires a companion action, which the brain relays to the Mac app over serial.
+    /// The firmware reuses the `keycombo` field as the generic payload for these.
+    static func companion(_ subtype: CompanionSubtype, payload: String) -> TriggerRequest {
+        TriggerRequest(mappingId: nil, keycombo: payload, isString: nil,
+                        isCompanion: true, companionSubtype: subtype.rawValue)
     }
 }
 
@@ -231,13 +244,53 @@ extension MacroStep: Codable {
     }
 }
 
+/// Actions the brain hands off to the Mac companion app over USB serial instead of
+/// emitting as HID keystrokes. These are things the brain fundamentally cannot do on
+/// its own — launching an app, running a Shortcut — because they need OS-level access.
+/// Raw values match the `subtype` strings in SERIAL_PROTOCOL.md exactly.
+enum CompanionSubtype: String, Codable, CaseIterable, Identifiable {
+    case openApp
+    case runShortcut
+    case runAppleScript
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .openApp:        return "Open App"
+        case .runShortcut:    return "Run Shortcut"
+        case .runAppleScript: return "Run AppleScript"
+        }
+    }
+
+    var placeholder: String {
+        switch self {
+        case .openApp:        return "Spotify"
+        case .runShortcut:    return "Focus Mode"
+        case .runAppleScript: return "tell application \"Finder\" to activate"
+        }
+    }
+
+    var helpText: String {
+        switch self {
+        case .openApp:
+            return "Launches the app directly via the Mac companion app. Unlike the keystroke fallback, this doesn't depend on Spotlight timing."
+        case .runShortcut:
+            return "Runs a Shortcut by name. It must already exist in the Shortcuts app on the Mac."
+        case .runAppleScript:
+            return "Runs a one-line AppleScript. macOS will ask for Automation permission the first time."
+        }
+    }
+}
+
 enum ButtonAction: Equatable {
     case none
     case fireMapping(id: Int, label: String)     // re-fire something already stored on the brain
     case keyCombo(String)                         // ad-hoc, e.g. "CTRL+Z" — not stored on the brain
     case typeText(String)                          // ad-hoc literal text
     case macro([MacroStep])                        // sequence of ad-hoc steps
-    case openApp(name: String, target: TargetOS)   // convenience preset — expands to a macro at fire-time
+    case openApp(name: String, target: TargetOS)   // blind keystroke fallback — see expandedSteps()
+    case companion(subtype: CompanionSubtype, payload: String)  // handed to the Mac companion app
     case switchProfile(index: Int)                  // local: calls setProfile(), no trigger involved
 
     static func == (lhs: ButtonAction, rhs: ButtonAction) -> Bool {
@@ -250,26 +303,31 @@ enum ButtonAction: Equatable {
         case let (.typeText(a), .typeText(b)): return a == b
         case let (.switchProfile(a), .switchProfile(b)): return a == b
         case let (.openApp(n1, t1), .openApp(n2, t2)): return n1 == n2 && t1 == t2
+        case let (.companion(s1, p1), .companion(s2, p2)): return s1 == s2 && p1 == p2
         default: return false
         }
     }
 
     /// Expands any action into the flat sequence of ad-hoc trigger steps needed to
-    /// actually execute it. `.fireMapping` and `.switchProfile` are handled separately
-    /// by the caller since they aren't ad-hoc HID sequences.
+    /// actually execute it. `.fireMapping`, `.switchProfile` and `.companion` are
+    /// handled separately by the caller since they aren't ad-hoc HID sequences.
     func expandedSteps() -> [MacroStep] {
         switch self {
         case .keyCombo(let k): return [.key(k)]
         case .typeText(let t): return [.type(t)]
         case .macro(let steps): return steps
         case .openApp(let name, let target):
+            // Blind, timed keystroke sequence — there's no confirmation the app opened,
+            // or even that the search field was focused in time. Kept because it's the
+            // only option on Windows, which has no companion app; on Mac prefer
+            // .companion(.openApp, name), which actually launches the app directly.
             switch target {
             case .mac:
                 return [.key("CMD+SPACE"), .wait(ms: 450), .type(name), .wait(ms: 250), .key("ENTER")]
             case .windows:
                 return [.key("GUI"), .wait(ms: 450), .type(name), .wait(ms: 250), .key("ENTER")]
             }
-        case .none, .fireMapping, .switchProfile:
+        case .none, .fireMapping, .switchProfile, .companion:
             return []
         }
     }
@@ -282,6 +340,7 @@ enum ButtonAction: Equatable {
         case .typeText(let t): return "Type: \(t)"
         case .macro: return "Macro"
         case .openApp(let name, let target): return "Open \(name) (\(target.displayName))"
+        case .companion(let subtype, let payload): return "\(subtype.displayName): \(payload)"
         case .switchProfile(let i): return "Profile \(i + 1)"
         }
     }
@@ -289,10 +348,10 @@ enum ButtonAction: Equatable {
 
 extension ButtonAction: Codable {
     private enum Kind: String, Codable {
-        case none, fireMapping, keyCombo, typeText, macro, openApp, switchProfile
+        case none, fireMapping, keyCombo, typeText, macro, openApp, companion, switchProfile
     }
     private enum CodingKeys: String, CodingKey {
-        case kind, id, label, value, steps, name, target, index
+        case kind, id, label, value, steps, name, target, index, subtype, payload
     }
 
     init(from decoder: Decoder) throws {
@@ -312,6 +371,9 @@ extension ButtonAction: Codable {
         case .openApp:
             self = .openApp(name: try c.decode(String.self, forKey: .name),
                              target: try c.decode(TargetOS.self, forKey: .target))
+        case .companion:
+            self = .companion(subtype: try c.decode(CompanionSubtype.self, forKey: .subtype),
+                               payload: try c.decode(String.self, forKey: .payload))
         case .switchProfile:
             self = .switchProfile(index: try c.decode(Int.self, forKey: .index))
         }
@@ -339,6 +401,10 @@ extension ButtonAction: Codable {
             try c.encode(Kind.openApp, forKey: .kind)
             try c.encode(name, forKey: .name)
             try c.encode(target, forKey: .target)
+        case .companion(let subtype, let payload):
+            try c.encode(Kind.companion, forKey: .kind)
+            try c.encode(subtype, forKey: .subtype)
+            try c.encode(payload, forKey: .payload)
         case .switchProfile(let index):
             try c.encode(Kind.switchProfile, forKey: .kind)
             try c.encode(index, forKey: .index)

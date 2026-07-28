@@ -12,6 +12,25 @@ enum AppTab {
     case deck, config
 }
 
+/// Derived from consecutive poll failures rather than a single failed request — WiFi
+/// blips constantly, and flashing "disconnected" on every dropped packet would be noise.
+/// One or two failures means "probably fine, retrying"; sustained failure is real.
+enum ConnectionState {
+    case connected
+    case reconnecting
+    case disconnected
+
+    var isHealthy: Bool { self == .connected }
+
+    var label: String {
+        switch self {
+        case .connected:    return "Connected"
+        case .reconnecting: return "Reconnecting..."
+        case .disconnected: return "Cliqmod disconnected"
+        }
+    }
+}
+
 @MainActor
 @Observable
 final class CliqmodStore {
@@ -23,6 +42,24 @@ final class CliqmodStore {
     private(set) var sources: [SourceEntry] = []
     private(set) var lastError: String?
     private(set) var isLoading = false
+
+    /// Consecutive failed refresh cycles. Reset to 0 on any success.
+    private(set) var consecutiveFailures = 0
+    private(set) var lastContact: Date?
+
+    /// How many failed cycles before we call it genuinely disconnected rather than a
+    /// transient blip. At the 4s poll interval that's roughly 12 seconds of silence.
+    private static let failuresBeforeDisconnected = 3
+
+    var connectionState: ConnectionState {
+        // Never reached the brain yet (fresh launch) counts as searching, not connected.
+        // Otherwise the first-ever connection attempt would use the slow steady-state
+        // poll interval, which is precisely when the user is waiting on it.
+        if lastContact == nil && consecutiveFailures == 0 { return .reconnecting }
+        if consecutiveFailures == 0 { return .connected }
+        if consecutiveFailures < Self.failuresBeforeDisconnected { return .reconnecting }
+        return .disconnected
+    }
 
     /// One grid layout per brain profile index — switching the active profile switches
     /// which virtual grid you see, same as switching profiles changes the physical
@@ -48,12 +85,27 @@ final class CliqmodStore {
 
     // MARK: - Polling
 
-    func startPolling(interval: Duration = .seconds(4)) {
+    /// Steady-state poll interval. Deliberately unhurried — the brain's web server
+    /// handles one connection at a time, so there's no value in hammering it once
+    /// everything is working.
+    private static let connectedPollInterval: Duration = .seconds(4)
+
+    /// Used while disconnected or pairing. The user is actively waiting for the device
+    /// to show up, so responsiveness matters more than politeness here — and if the
+    /// brain isn't reachable, these requests fail fast rather than loading it.
+    private static let searchingPollInterval: Duration = .seconds(1)
+
+    func startPolling(interval: Duration? = nil) {
         stopPolling()
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 await self?.refresh()
-                try? await Task.sleep(for: interval)
+                guard let self else { return }
+                let next = interval
+                    ?? (self.connectionState.isHealthy
+                        ? Self.connectedPollInterval
+                        : Self.searchingPollInterval)
+                try? await Task.sleep(for: next)
             }
         }
     }
@@ -69,6 +121,7 @@ final class CliqmodStore {
 
         if await tryFetch() {
             defaults.set(await client.baseURL.absoluteString, forKey: Self.lastWorkingHostKey)
+            markSuccess()
             return
         }
 
@@ -82,11 +135,19 @@ final class CliqmodStore {
             await client.updateBaseURL(url)
             if await tryFetch() {
                 defaults.set(candidate, forKey: Self.lastWorkingHostKey)
+                markSuccess()
                 return
             }
         }
-        // Both candidates failed this cycle — lastError already set by the final
-        // tryFetch() attempt. Next poll tick tries again from wherever we ended up.
+        // Every candidate address failed this cycle — that's one strike toward being
+        // considered genuinely disconnected. Next tick tries again from wherever we
+        // ended up; lastError was already set by the final tryFetch().
+        consecutiveFailures += 1
+    }
+
+    private func markSuccess() {
+        consecutiveFailures = 0
+        lastContact = Date()
     }
 
     /// Single attempt against whatever client.baseURL currently is. Returns whether it
@@ -136,20 +197,34 @@ final class CliqmodStore {
 
     /// Executes whatever's bound to a Deck slot. Mapping/profile actions call the brain
     /// directly; everything else expands to a MacroStep sequence run client-side.
-    func fire(_ action: ButtonAction) async {
+    ///
+    /// Returns whether it actually reached the brain, so the UI can give feedback — a
+    /// silently-failed button press is indistinguishable from a working one otherwise.
+    @discardableResult
+    func fire(_ action: ButtonAction) async -> Bool {
         do {
             switch action {
             case .none:
-                return
+                return true
             case .fireMapping(let id, _):
                 try await client.trigger(.mapping(id))
             case .switchProfile(let index):
                 await setActiveProfile(index)
+            case .companion(let subtype, let payload):
+                // Not a HID sequence — the brain relays this to the Mac companion app
+                // over serial, which does the actual OS-level work.
+                try await client.trigger(.companion(subtype, payload: payload))
             case .keyCombo, .typeText, .macro, .openApp:
                 try await MacroRunner.run(action.expandedSteps(), using: client)
             }
+            markSuccess()
+            return true
         } catch {
             lastError = "Trigger failed: \(error.localizedDescription)"
+            // A failed trigger is just as much evidence of a dead connection as a failed
+            // poll, and it's more immediate — the user is actively pressing a button.
+            consecutiveFailures += 1
+            return false
         }
     }
 

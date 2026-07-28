@@ -35,6 +35,23 @@ actor CliqmodClient {
         case decoding(Error)
     }
 
+    /// Short timeouts, deliberately. URLSession.shared defaults to 60s per request,
+    /// which is catastrophic here: the app probes two candidate addresses in sequence,
+    /// so one unreachable host could stall a poll cycle for a full minute and two could
+    /// stall it for two. That's what made the pairing screen look frozen after the brain
+    /// reset back to AP mode while the app still had the old address saved.
+    ///
+    /// The brain is a device on the same LAN — it either answers in well under a second
+    /// or it isn't reachable at all, so waiting longer never produces a better outcome.
+    private let session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 3
+        config.timeoutIntervalForResource = 6
+        // Don't let a cached response mask a device that's actually gone.
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: config)
+    }()
+
     // MARK: - Reads
 
     func fetchState() async throws -> CliqmodState {
@@ -83,7 +100,7 @@ actor CliqmodClient {
     // MARK: - Low-level helpers
 
     private func get<T: Decodable>(_ path: String) async throws -> T {
-        let (data, response) = try await URLSession.shared.data(from: baseURL.appendingPathComponent(path))
+        let (data, response) = try await session.data(from: baseURL.appendingPathComponent(path))
         try Self.checkStatus(response)
         do { return try JSONDecoder().decode(T.self, from: data) }
         catch { throw ClientError.decoding(error) }
@@ -96,7 +113,7 @@ actor CliqmodClient {
         if let body {
             request.httpBody = try JSONEncoder().encode(body)
         }
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await session.data(for: request)
         try Self.checkStatus(response)
         do { return try JSONDecoder().decode(T.self, from: data) }
         catch { throw ClientError.decoding(error) }

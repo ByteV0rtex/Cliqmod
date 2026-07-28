@@ -37,9 +37,23 @@ struct ConfigView: View {
                     ProgressView("Connecting...")
                 }
 
-                if let error = store.lastError {
+                if !store.connectionState.isHealthy {
                     Section {
-                        Text(error).foregroundStyle(.red).font(.caption)
+                        HStack(spacing: 8) {
+                            Image(systemName: store.connectionState == .disconnected
+                                  ? "wifi.slash" : "arrow.triangle.2.circlepath")
+                                .foregroundStyle(store.connectionState == .disconnected ? Color.red : Color.orange)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(store.connectionState.label)
+                                    .font(.subheadline.weight(.semibold))
+                                if let error = store.lastError {
+                                    Text(error).font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            Button("Retry") { Task { await store.refresh() } }
+                                .buttonStyle(.bordered)
+                        }
                     }
                 }
             }
@@ -156,10 +170,16 @@ struct ConfigView: View {
 
     // MARK: - Mapping mutations (the API always replaces a profile's whole mapping list)
 
+    /// Rebuilds the full payload list for a profile. This has to preserve every field,
+    /// including the companion ones: POST /api/mappings replaces a profile's entire
+    /// mapping list, so anything dropped here is silently erased from every mapping the
+    /// user didn't touch.
     private func currentPayloads(from mappings: [Mapping]) -> [MappingPayload] {
         mappings.map {
             MappingPayload(label: $0.label, keycombo: $0.keycombo, srcCode: $0.srcCode,
-                            controlId: $0.controlId, eventType: $0.eventType, isString: $0.isString)
+                            controlId: $0.controlId, eventType: $0.eventType, isString: $0.isString,
+                            isCompanion: $0.isCompanion ?? false,
+                            companionSubtype: $0.companionSubtype ?? "")
         }
     }
 
